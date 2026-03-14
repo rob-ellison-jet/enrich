@@ -100,21 +100,14 @@ object Environment {
       factory <- toFactory(config.main.streams)
       sourceAndAck <- factory.source(config.main.input)
       sourceReporter = sourceAndAck.isHealthy(config.main.monitoring.healthProbe.unhealthyLatency).map(_.showIfUnhealthy)
-      appHealth <- Resource.eval(AppHealth.init[F, String, RuntimeService](List(sourceReporter)))
-      _ <- HealthProbe.resource(config.main.monitoring.healthProbe.port, appHealth)
-      enrichedSink <- factory.sink(config.main.output.good.sink).onError {
-                        case _ => Resource.eval(appHealth.beUnhealthyForRuntimeService(RuntimeService.EnrichedSink))
-                      }
-      failedSink <- config.main.output.failed.traverse { sinkConfig =>
-                      factory
-                        .sink(sinkConfig.sink)
-                        .onError {
-                          case _ => Resource.eval(appHealth.beUnhealthyForRuntimeService(RuntimeService.FailedSink))
-                        }
-                    }
-      badSink <- factory.sink(config.main.output.bad.sink).onError {
-                   case _ => Resource.eval(appHealth.beUnhealthyForRuntimeService(RuntimeService.BadSink))
-                 }
+      enrichedSink <- factory.sink(config.main.output.good.sink)
+      failedSink   <- config.main.output.failed.traverse(sc => factory.sink(sc.sink))
+      badSink      <- factory.sink(config.main.output.bad.sink)
+      appHealth    <- Resource.eval(AppHealth.init[F, String, RuntimeService](
+                        List(sourceReporter, enrichedSink.healthReporter, badSink.healthReporter)
+                          ++ failedSink.map(_.healthReporter).toList
+                      ))
+      _            <- HealthProbe.resource(config.main.monitoring.healthProbe.port, appHealth)
       metrics <- Resource.eval(Metrics.build(config.main.monitoring.metrics))
       cpuParallelism = chooseCpuParallelism(config.main)
       sinkParallelism = chooseSinkParallelism(config.main)
