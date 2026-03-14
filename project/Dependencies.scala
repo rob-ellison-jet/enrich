@@ -16,6 +16,8 @@ import sbt._
 object Dependencies {
 
   val resolutionRepos = Seq(
+    // For local development builds
+    Resolver.mavenLocal,
     // For some Twitter libs and uaParser utils
     "Concurrent Maven Repo" at "https://conjars.org/repo",
     // For Twitter's util functions

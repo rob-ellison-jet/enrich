@@ -134,6 +134,18 @@ object BuildSettings {
     resolvers ++= Dependencies.resolutionRepos
   )
 
+  private val commonStreamsBase = file("/Users/rob.ellison/repos/common-streams/modules")
+
+  /** Local common-streams JARs built from the local/combined-fixes branch. */
+  lazy val localCommonStreamsJars = Seq(
+    Compile / unmanagedJars ++= Seq(
+      Attributed.blank((commonStreamsBase / "runtime-common/target/scala-2.12/runtime-common_2.12-0.21.0-local.jar").getCanonicalFile),
+      Attributed.blank((commonStreamsBase / "streams-core/target/scala-2.12/streams-core_2.12-0.21.0-local.jar").getCanonicalFile),
+      Attributed.blank((commonStreamsBase / "kafka/target/scala-2.12/kafka_2.12-0.21.0-local.jar").getCanonicalFile),
+      Attributed.blank((commonStreamsBase / "loaders-common/target/scala-2.12/loaders-common_2.12-0.21.0-local.jar").getCanonicalFile)
+    )
+  )
+
   lazy val formattingSettings = Seq(
     scalafmtConfig := file(".scalafmt.conf"),
     scalafmtOnCompile := false
@@ -200,7 +212,7 @@ object BuildSettings {
 
   lazy val coreBuildSettings = {
     // Project
-    coreProjectSettings ++ buildSettings ++
+    coreProjectSettings ++ buildSettings ++ localCommonStreamsJars ++
       // Tests
       noParallelTestExecution ++ addExampleConfToTestCp ++ Seq(
       Test / fork := true,
@@ -267,10 +279,13 @@ object BuildSettings {
 
   lazy val kafkaBuildSettings = {
     // Project
-    kafkaProjectSettings ++ buildSettings ++
+    kafkaProjectSettings ++ buildSettings ++ localCommonStreamsJars ++
       // Build and publish
       dockerSettingsFocal ++
-      Seq(Docker / packageName := "snowplow-enrich-kafka") ++
+      Seq(
+        Docker / packageName := "snowplow-enrich-kafka",
+        dockerBaseImage := "artifacts.takeaway.com/docker-virtual/snowplow/snowplow-enrich-kafka:6.8.0"
+      ) ++
       // Tests
       noParallelTestExecution ++ addExampleConfToTestCp
   }
