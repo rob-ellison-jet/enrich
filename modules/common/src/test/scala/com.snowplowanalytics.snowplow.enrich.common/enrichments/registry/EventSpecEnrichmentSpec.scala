@@ -174,6 +174,24 @@ class EventSpecEnrichmentSpec extends Specification with CatsEffect {
   EventSpecEnrichment#inferEventSpec should match versioned specs with event constraints (>3 versions) $e23
   EventSpecEnrichment#inferEventSpec should match versioned specs with entity constraints (<=3 versions) $e24
   EventSpecEnrichment#inferEventSpec should match versioned specs with entity constraints (>3 versions) $e25
+  EventSpecEnrichment#processEvent should route to inference when no event_specification context $e34
+  EventSpecEnrichment#processEvent should route to validation when event_specification context has version $e35
+  EventSpecEnrichment#processEvent should skip when event_specification context has no version $e36
+  EventSpecEnrichment#processEvent should return failure context when event constraint fails $e41
+  EventSpecEnrichment#validateEventSpec should produce structured error for cardinality min $e44
+  EventSpecEnrichment#validateEventSpec should produce structured error for cardinality max $e45
+  EventSpecEnrichment#validateEventSpec should produce structured error for entity constraint $e46
+  EventSpecEnrichment#validateEventSpec should aggregate event constraint and cardinality errors $e47
+  EventSpecEnrichment#processEvent should return empty list for valid event $e48
+  EventSpecEnrichment#processEvent should attach failure context for cardinality failure $e49
+  EventSpecEnrichment#validateEventSpec should return Valid for spec in cache with no constraints $e26
+  EventSpecEnrichment#validateEventSpec should return Valid for spec in cache passing constraint $e27
+  EventSpecEnrichment#validateEventSpec should return Invalid when event constraint fails (cache) $e28
+  EventSpecEnrichment#validateEventSpec should return Invalid when required entity missing (cache) $e29
+  EventSpecEnrichment#validateEventSpec should return Invalid when entity constraint fails (cache) $e30
+  EventSpecEnrichment#validateEventSpec should return SpecNotFound for non-existent version $e31
+  EventSpecEnrichment#validateEventSpec should return Valid for spec promoted from archive $e32
+  EventSpecEnrichment#validateEventSpec should return Invalid when event constraint fails (archive) $e33
   """
 
   def e1 = {
@@ -600,7 +618,7 @@ class EventSpecEnrichmentSpec extends Specification with CatsEffect {
       enrichment = result.fold(e => sys.error(e), identity)
       found <- enrichment.lookupInCache(esId1, 99)
     } yield found must beLeft.like {
-      case err: EventSpecEnrichment.LookupError.NotFound => err.version must beEqualTo(99)
+      case err => err.message must contain("version=99")
     }
   }
 
@@ -703,6 +721,386 @@ class EventSpecEnrichmentSpec extends Specification with CatsEffect {
         case enrichment =>
           enrichment.inferEventSpec(eventWithBothEntities, maxJsonDepth) must beEqualTo(expectedSpecs)
       }
+    }
+  }
+
+  def e26 = {
+    val specs = (0 to 2).toList.map { v =>
+      mkSpec(esId1, s"$esName1-v$v", pagePingSchemaKey, version = Some(v))
+    }
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 1, maxJsonDepth)
+    } yield validation must beEmpty
+  }
+
+  def e27 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), constraint = Some(testConstraint))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      page_url = "test.com"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield validation must beEmpty
+  }
+
+  def e28 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), constraint = Some(testConstraint))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      page_url = "wrong.com"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      (validation must haveSize(1)) and (errors must not(beEmpty))
+    }
+  }
+
+  def e29 = {
+    val requiredEntity = mkEntity(customEntityKey, minCardinality = Some(1))
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), entities = List(requiredEntity))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      errors.flatMap(_.hcursor.get[String]("message").toOption) must contain(contain("expected at least 1"))
+    }
+  }
+
+  def e30 = {
+    val entityWithConstraint = mkEntity(customEntityKey, minCardinality = Some(1), constraint = Some(someValueConstraint))
+    val specs = List(
+      mkSpec(esId1, esName1, customEventKey, version = Some(0), entities = List(entityWithConstraint))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      unstruct_event = Some(
+        SelfDescribingData(customEventKey, json"""{"some_field": "some_value"}""")
+      )
+      contexts = List(
+        SelfDescribingData(customEntityKey, json"""{"some_field": "wrong_value"}""")
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      (validation must haveSize(1)) and (errors must not(beEmpty))
+    }
+  }
+
+  def e31 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0))
+    )
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event = new EnrichedEvent, "nonexistent", 99, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      val message = errors.head.hcursor.get[String]("message").getOrElse("")
+      val errorKeys = errors.head.hcursor.keys.map(_.toList).getOrElse(List.empty)
+      (validation must haveSize(1)) and (message must contain("not found")) and (errorKeys must beEqualTo(List("message")))
+    }
+  }
+
+  def e32 = {
+    val specs = (0 to 4).toList.map { v =>
+      mkSpec(esId1, s"$esName1-v$v", pagePingSchemaKey, version = Some(v))
+    }
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield validation must beEmpty
+  }
+
+  def e33 = {
+    val specs = (0 to 4).toList.map { v =>
+      mkSpec(esId1, s"$esName1-v$v", pagePingSchemaKey, version = Some(v), constraint = Some(testConstraint))
+    }
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      page_url = "wrong.com"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      (validation must haveSize(1)) and (errors must not(beEmpty))
+    }
+  }
+
+  def e34 = {
+    val specs = List(mkSpec(esId1, esName1, pagePingSchemaKey))
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+    }
+    val expectedSpecs = List(mkEventSpecSDJ(esId1, esName1))
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      actual <- enrichment.processEvent(event, maxJsonDepth)
+    } yield actual must beEqualTo(expectedSpecs)
+  }
+
+  def e35 = {
+    val specs = List(mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0)))
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      contexts = List(
+        SelfDescribingData(
+          eventSpecSchemaKey,
+          json"""{"id": $esId1, "version": 0}"""
+        )
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      actual <- enrichment.processEvent(event, maxJsonDepth)
+    } yield actual must beEmpty
+  }
+
+  def e36 = {
+    val specs = List(mkSpec(esId1, esName1, pagePingSchemaKey))
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      contexts = List(
+        SelfDescribingData(
+          eventSpecSchemaKey,
+          json"""{"id": $esId1}"""
+        )
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      actual <- enrichment.processEvent(event, maxJsonDepth)
+    } yield actual must beEmpty
+  }
+
+  def e41 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), constraint = Some(testConstraint))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      page_url = "wrong.com"
+      contexts = List(
+        SelfDescribingData(
+          eventSpecSchemaKey,
+          json"""{"id": $esId1, "version": 0}"""
+        )
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      actual <- enrichment.processEvent(event, maxJsonDepth)
+    } yield {
+      val errors = actual.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      (actual must haveSize(1)) and (errors must not(beEmpty))
+    }
+  }
+
+  def e44 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), entities = List(mkEntity(customEntityKey, minCardinality = Some(1))))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      val first = errors.head.hcursor
+      (validation must haveSize(1)) and
+        (errors must haveSize(1)) and
+        (first.get[String]("message").getOrElse("") must contain("expected at least 1")) and
+        (first.get[String]("schema").getOrElse("") must beEqualTo(customEntityKey.toSchemaUri)) and
+        (first.keys.map(_.toList).getOrElse(List.empty) must containTheSameElementsAs(List("message", "schema")))
+    }
+  }
+
+  def e45 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), entities = List(mkEntity(customEntityKey, maxCardinality = Some(1))))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      contexts = List(
+        SelfDescribingData(customEntityKey, json"""{"some_field": "a"}"""),
+        SelfDescribingData(customEntityKey, json"""{"some_field": "b"}""")
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      val first = errors.head.hcursor
+      (validation must haveSize(1)) and
+        (errors must haveSize(1)) and
+        (first.get[String]("message").getOrElse("") must contain("expected at most 1, found 2")) and
+        (first.get[String]("schema").getOrElse("") must beEqualTo(customEntityKey.toSchemaUri))
+    }
+  }
+
+  def e46 = {
+    val entityWithConstraint = mkEntity(customEntityKey, minCardinality = Some(1), constraint = Some(someValueConstraint))
+    val specs = List(
+      mkSpec(esId1, esName1, customEventKey, version = Some(0), entities = List(entityWithConstraint))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      unstruct_event = Some(SelfDescribingData(customEventKey, json"""{"some_field": "some_value"}"""))
+      contexts = List(SelfDescribingData(customEntityKey, json"""{"some_field": "wrong_value"}"""))
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      val first = errors.head.hcursor
+      (validation must haveSize(1)) and
+        (errors must haveSize(1)) and
+        (first.get[String]("schema").getOrElse("") must beEqualTo(customEntityKey.toSchemaUri)) and
+        (first.get[String]("path").toOption must beSome) and
+        (first.keys.map(_.toList).getOrElse(List.empty) must containTheSameElementsAs(List("message", "schema", "path")))
+    }
+  }
+
+  def e47 = {
+    val specs = List(
+      mkSpec(
+        esId1,
+        esName1,
+        pagePingSchemaKey,
+        version = Some(0),
+        constraint = Some(wrongConstraint),
+        entities = List(mkEntity(customEntityKey, minCardinality = Some(1)))
+      )
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      page_url = "test.com"
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      validation <- enrichment.validateEventSpec(event, esId1, 0, maxJsonDepth)
+    } yield {
+      val errors = validation.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      val schemas = errors.flatMap(_.hcursor.get[String]("schema").toOption)
+      (validation must haveSize(1)) and
+        (errors must haveSize(2)) and
+        (schemas must containTheSameElementsAs(List(pagePingSchemaKey.toSchemaUri, customEntityKey.toSchemaUri)))
+    }
+  }
+
+  def e48 = {
+    val specs = List(mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0)))
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      contexts = List(
+        SelfDescribingData(eventSpecSchemaKey, json"""{"id": $esId1, "version": 0}""")
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      actual <- enrichment.processEvent(event, maxJsonDepth)
+    } yield actual must beEmpty
+  }
+
+  def e49 = {
+    val specs = List(
+      mkSpec(esId1, esName1, pagePingSchemaKey, version = Some(0), entities = List(mkEntity(customEntityKey, minCardinality = Some(1))))
+    )
+    val event = new EnrichedEvent {
+      app_id = "some-app-id"
+      event_name = "page_ping"
+      contexts = List(
+        SelfDescribingData(eventSpecSchemaKey, json"""{"id": $esId1, "version": 0}""")
+      )
+    }
+
+    for {
+      result <- EventSpecEnrichment.createFromSpecs[IO](specs)
+      enrichment = result.fold(e => sys.error(e), identity)
+      actual <- enrichment.processEvent(event, maxJsonDepth)
+    } yield {
+      val isValid = actual.head.data.hcursor.get[Boolean]("isValid").getOrElse(true)
+      val errors = actual.head.data.hcursor.downField("errors").values.map(_.toList).getOrElse(List.empty)
+      val message = errors.head.hcursor.get[String]("message").getOrElse("")
+      (actual must haveSize(1)) and (isValid must beFalse) and (errors must haveSize(1)) and (message must contain("expected at least 1"))
     }
   }
 

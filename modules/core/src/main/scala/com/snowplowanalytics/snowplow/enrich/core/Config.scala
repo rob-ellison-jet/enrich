@@ -45,6 +45,7 @@ import com.snowplowanalytics.iglu.core.circe.implicits._
 
 import com.snowplowanalytics.snowplow.runtime.{AcceptedLicense, Metrics => CommonMetrics, Retrying, Telemetry, Sentry}
 import com.snowplowanalytics.snowplow.runtime.HealthProbe.decoders._
+import com.snowplowanalytics.snowplow.streams.compression.DecompressionConfig
 
 import com.snowplowanalytics.snowplow.enrich.common.adapters._
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.AtomicFields
@@ -67,7 +68,8 @@ case class Config[+Factory, +Source, +Sink, +BlobClients](
   identity: Option[Config.Identity],
   blobClients: BlobClients,
   adaptersSchemas: AdaptersSchemas,
-  decompression: Config.Decompression,
+  decompression: DecompressionConfig,
+  compression: Config.Compression,
   http: Config.Http,
   iglu: Config.Iglu
 )
@@ -202,6 +204,19 @@ object Config {
 
   type Identity = IdentityM[Id]
 
+  case class Compression(
+    enabled: Boolean,
+    `type`: Compression.Type,
+    gzipCompressionLevel: Int,
+    zstdCompressionLevel: Int
+  )
+
+  object Compression {
+    sealed trait Type
+    case object GZIP extends Type
+    case object ZSTD extends Type
+  }
+
   case class Http(
     client: HttpClient
   )
@@ -214,18 +229,6 @@ object Config {
     maxRetry: Int,
     maxWait: FiniteDuration
   )
-
-  /**
-   * Configures behaviour of the parser when decompressing
-   *
-   *  @param maxBytesInBatch: A cutoff used when incrementally adding events to a batch. The batch
-   *    is emitted immediately when this cutoff size is reached. This config parameter is needed to
-   *    protect the app's memory.  Bear in mind a 1MB compressed message could become HUGE after
-   *    decompression.
-   *  @param maxBytesSinglePayload: Each individual message should not exceed this size, after
-   *    decompression.
-   */
-  case class Decompression(maxBytesInBatch: Int, maxBytesSinglePayload: Int)
 
   implicit def decoder[
     Factory: Decoder,
@@ -375,10 +378,18 @@ object Config {
       deriveConfiguredDecoder[VeroSchemas]
     implicit val adaptersSchemasDecoder: Decoder[AdaptersSchemas] =
       deriveConfiguredDecoder[AdaptersSchemas]
-    implicit val decompressionDecoder: Decoder[Decompression] =
-      deriveConfiguredDecoder[Decompression]
+    implicit val decompressionDecoder: Decoder[DecompressionConfig] =
+      DecompressionConfig.decoder
     implicit val httpClientDecoder: Decoder[HttpClient] =
       deriveConfiguredDecoder[HttpClient]
+    implicit val compressionTypeDecoder: Decoder[Compression.Type] = Decoder[String].emap { str =>
+      str.toLowerCase match {
+        case "gzip" => Right(Compression.GZIP)
+        case "zstd" => Right(Compression.ZSTD)
+        case _ => Left(s"Unsupported compression type $str")
+      }
+    }
+    implicit val compressionDecoder = deriveConfiguredDecoder[Compression]
     implicit val httpDecoder: Decoder[Http] =
       deriveConfiguredDecoder[Http]
     implicit val igluDecoder: Decoder[Iglu] =

@@ -171,9 +171,18 @@ object EnrichmentManager {
                        )
     } yield {
       val (maybeUnstruct, maybeContexts) = parseResult
-      enrichedEvent.unstruct_event = maybeUnstruct.map(_.unstruct.sdj)
+      maybeUnstruct match {
+        case Some(IgluUtils.ValidUnstruct(validSdj)) =>
+          enrichedEvent.unstruct_event = Some(validSdj.sdj)
+          enrichedEvent.unstruct_event_valid_schema_key = Some(validSdj.sdj.schema)
+        case Some(IgluUtils.InvalidUnstruct(schemaKey)) =>
+          enrichedEvent.unstruct_event_valid_schema_key = Some(schemaKey)
+        case None =>
+          ()
+      }
       maybeContexts.foreach(c => enrichedEvent.contexts = c.contexts.map(_.sdj).toList)
-      val unstructValidationInfo = maybeUnstruct.flatMap(_.unstruct.validationInfo.map(_.toSdj)).toList
+      val unstructValidationInfo =
+        maybeUnstruct.collect { case IgluUtils.ValidUnstruct(v) => v }.flatMap(_.validationInfo.map(_.toSdj)).toList
       val contextsValidationInfo = maybeContexts.map(_.contexts.toList.flatMap(_.validationInfo.map(_.toSdj))).toList.flatten
       unstructValidationInfo ++ contextsValidationInfo
     }
@@ -938,12 +947,13 @@ object EnrichmentManager {
         }
     }
 
-  def getEventSpecContext[F[_]: Applicative](eventSpecEnrichment: Option[EventSpecEnrichment[F]], maxJsonDepth: Int): EStateT[F, Unit] =
-    EStateT.fromEither {
+  def getEventSpecContext[F[_]: Monad](eventSpecEnrichment: Option[EventSpecEnrichment[F]], maxJsonDepth: Int): EStateT[F, Unit] =
+    EStateT.fromEitherF {
       case (event, _) =>
-        eventSpecEnrichment match {
-          case Some(ese) => ese.inferEventSpec(event, maxJsonDepth).asRight
-          case None => List.empty[SelfDescribingData[Json]].asRight
+        eventSpecEnrichment.fold(
+          Monad[F].pure(List.empty[SelfDescribingData[Json]].asRight[NonEmptyList[FailureDetails.EnrichmentFailure]])
+        ) {
+          _.processEvent(event, maxJsonDepth).map(_.asRight[NonEmptyList[FailureDetails.EnrichmentFailure]])
         }
     }
 }

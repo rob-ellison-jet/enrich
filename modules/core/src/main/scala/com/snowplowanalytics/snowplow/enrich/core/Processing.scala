@@ -27,8 +27,16 @@ import cats.effect.implicits._
 
 import fs2.{Pipe, Stream}
 
-import com.snowplowanalytics.snowplow.badrows.{BadRow, Failure => BadRowFailure, Payload => BadRowPayload, Processor => BadRowProcessor}
-import com.snowplowanalytics.snowplow.streams.{EventProcessingConfig, EventProcessor, ListOfList, Sinkable}
+import com.snowplowanalytics.snowplow.badrows.{
+  BadRow,
+  Failure => BadRowFailure,
+  FailureDetails,
+  Payload => BadRowPayload,
+  Processor => BadRowProcessor
+}
+import com.snowplowanalytics.snowplow.streams.{EventProcessingConfig, ListOfList, Sinkable}
+import com.snowplowanalytics.snowplow.streams.compression.{Compressor, GzipCompressor, ZstdCompressor}
+import com.snowplowanalytics.snowplow.streams.compression.Decompression._
 import com.snowplowanalytics.snowplow.runtime.syntax.foldable._
 
 import com.snowplowanalytics.snowplow.enrich.common.EtlPipeline
@@ -39,16 +47,24 @@ import com.snowplowanalytics.snowplow.enrich.common.enrichments.EnrichmentRegist
 
 object Processing {
 
+  // Format version written into the compressed header for enriched TSV output.
+  private val CompressedEnrichedVersion = 1
+
   def stream[F[_]: Async](env: Environment[F]): Stream[F, Nothing] =
     env.source
-      .stream(EventProcessingConfig(EventProcessingConfig.NoWindowing, env.metrics.setLatency), eventProcessor(env))
+      .decompressedStream(
+        EventProcessingConfig(EventProcessingConfig.NoWindowing, env.metrics.setLatency),
+        env.decompression,
+        eventProcessor(env),
+        env.badRowProcessor,
+        toBadRow(env.badRowProcessor)
+      )
       .concurrently(env.enrichmentRegistry.refreshStream(env.assetsUpdatePeriod))
 
   private def eventProcessor[F[_]: Async](
     env: Environment[F]
-  ): EventProcessor[F] =
-    _.through(PayloadProvider.pipe(env.badRowProcessor, env.decompressionConfig))
-      .through(parseBytes(env))
+  ): DecompressedEventProcessor[F] =
+    _.through(parseBytes(env))
       .through(enrich(env))
       .through(addIdentityContexts(env))
       .through(collectMetadata(env))
@@ -76,15 +92,32 @@ object Processing {
 
   private case class Serialized(
     enriched: List[Sinkable],
+    enrichedCount: Int,
+    enrichedBytesCount: Long,
     failed: List[Sinkable],
     bad: ListOfList[Sinkable],
     collectorTstamp: Option[DateTime],
     token: Option[Unique.Token]
   )
 
+  private case class Compressed(
+    records: List[Sinkable],
+    count: Int,
+    recordsBytesCount: Long,
+    sizeViolations: List[Sinkable]
+  )
+
+  private def toBadRow(processor: BadRowProcessor): DecompressionError => BadRow =
+    err =>
+      BadRow.CPFormatViolation(
+        processor,
+        BadRowFailure.CPFormatViolation(err.timestamp, "compression", FailureDetails.CPFormatViolationMessage.Fallback(err.message)),
+        BadRowPayload.RawPayload(err.payload)
+      )
+
   private def parseBytes[F[_]: Async](
     env: Environment[F]
-  ): Pipe[F, PayloadProvider.Result, Parsed] =
+  ): Pipe[F, DecompressedTokenedEvents, Parsed] =
     _.evalMap { input =>
       for {
         etlTstamp <- Sync[F].realTimeInstant
@@ -170,34 +203,119 @@ object Processing {
   ): Pipe[F, Enriched, Serialized] = { in =>
     in.evalMap { enriched =>
       Sync[F].delay {
-        val (sizeViolations, good) = enriched.enriched.foldLeft((List.empty[Sinkable], List.empty[Sinkable])) {
-          case ((ls, rs), e) =>
-            serializeEnriched(e,
-                              env.partitionKeyField,
-                              env.attributeFields,
-                              env.sinkMaxSize,
-                              env.badRowProcessor,
-                              enriched.etlTstamp
-            ) match {
-              case Left(sv) => (sv :: ls, rs)
-              case Right(e) => (ls, e :: rs)
-            }
+        val failed = enriched.failed.flatMap { f =>
+          serializeFailed(f, env.partitionKeyField, env.attributeFields, env.sinkMaxSize)
         }
-        val failed = enriched.failed.map { failed =>
-          serializeFailed(failed, env.partitionKeyField, env.attributeFields, env.sinkMaxSize)
-        }.flatten
         val bad = enriched.bad.mapUnordered { br =>
           serializeBad(br, env.sinkMaxSize, env.badRowProcessor, enriched.etlTstamp)
         }
-        Serialized(
-          good,
-          failed,
-          bad.prepend(sizeViolations),
-          enriched.collectorTstamp,
-          enriched.token
-        )
+        if (env.compression.enabled) {
+          // Partition key and attributes are not propagated when compression is enabled,
+          // because multiple records are merged into a single compressed payload.
+          val rawSinkables = enriched.enriched.map { e =>
+            Sinkable(ConversionUtils.tabSeparatedEnrichedEvent(e).getBytes(UTF_8), None, Map.empty)
+          }
+          val compressed =
+            compressBatch(rawSinkables, env.compression, env.sinkMaxSize, env.badRowProcessor, enriched.etlTstamp)
+          Serialized(
+            compressed.records,
+            compressed.count,
+            compressed.recordsBytesCount,
+            failed,
+            bad.prepend(compressed.sizeViolations),
+            enriched.collectorTstamp,
+            enriched.token
+          )
+        } else {
+          val (sizeViolations, good, bytesCount) =
+            enriched.enriched.foldLeft((List.empty[Sinkable], List.empty[Sinkable], 0L)) {
+              case ((ls, rs, bs), e) =>
+                serializeEnriched(e,
+                                  env.partitionKeyField,
+                                  env.attributeFields,
+                                  env.sinkMaxSize,
+                                  env.badRowProcessor,
+                                  enriched.etlTstamp
+                ) match {
+                  case Left(sv) => (sv :: ls, rs, bs)
+                  case Right(s) => (ls, s :: rs, bs + s.bytes.length.toLong)
+                }
+            }
+          Serialized(
+            good,
+            good.size,
+            bytesCount,
+            failed,
+            bad.prepend(sizeViolations),
+            enriched.collectorTstamp,
+            enriched.token
+          )
+        }
       }
     }
+  }
+
+  private def compressBatch(
+    sinkables: List[Sinkable],
+    compression: Config.Compression,
+    maxRecordSize: Int,
+    processor: BadRowProcessor,
+    etlTstamp: Instant
+  ): Compressed = {
+    val factory = compression.`type` match {
+      case Config.Compression.GZIP => GzipCompressor.factory(compression.gzipCompressionLevel)
+      case Config.Compression.ZSTD => ZstdCompressor.factory(compression.zstdCompressionLevel)
+    }
+
+    @scala.annotation.tailrec
+    def go(
+      remaining: List[Sinkable],
+      compressor: Compressor,
+      compressed: List[Sinkable],
+      count: Int,
+      compressedBytesCount: Long,
+      oversized: List[Sinkable]
+    ): Compressed =
+      remaining match {
+        case Nil =>
+          val last =
+            if (compressor.recordCount > 0) List(Sinkable(byteBufferToArray(compressor.result), None, Map.empty))
+            else { compressor.close(); Nil }
+          Compressed(last ::: compressed, count, compressedBytesCount, oversized)
+        case sinkable :: rest =>
+          val bytes = sinkable.bytes
+          if (compressor.addRecord(bytes, 0, bytes.length))
+            go(rest, compressor, compressed, count + 1, compressedBytesCount + bytes.length, oversized)
+          else {
+            val newCompressed =
+              if (compressor.recordCount > 0) Sinkable(byteBufferToArray(compressor.result), None, Map.empty) :: compressed
+              else compressed
+            val fresh = factory.buildAndInitialize(maxRecordSize, CompressedEnrichedVersion)
+            if (fresh.addRecord(bytes, 0, bytes.length))
+              go(rest, fresh, newCompressed, count + 1, compressedBytesCount + bytes.length, oversized)
+            else {
+              // Record can't fit even in a fresh compressor — emit as a size violation bad row
+              val tsv = new String(bytes, UTF_8)
+              val error = s"Enriched event exceeds the maximum allowed size of $maxRecordSize bytes after compression"
+              val badRow = mkSizeViolation(tsv, maxRecordSize, processor, error, etlTstamp)
+              go(rest,
+                 factory.buildAndInitialize(maxRecordSize, CompressedEnrichedVersion),
+                 newCompressed,
+                 count,
+                 compressedBytesCount,
+                 badRow :: oversized
+              )
+            }
+          }
+      }
+
+    go(sinkables, factory.buildAndInitialize(maxRecordSize, CompressedEnrichedVersion), Nil, 0, 0L, Nil)
+  }
+
+  private def byteBufferToArray(buf: java.nio.ByteBuffer): Array[Byte] = {
+    val arr = new Array[Byte](buf.remaining)
+    buf.get(arr)
+    arr
   }
 
   private def serializeEnriched(
@@ -271,9 +389,10 @@ object Processing {
     batch: Serialized
   ): F[Unit] =
     batch match {
-      case Serialized(enriched, _, _, _, _) if enriched.nonEmpty =>
+      case Serialized(enriched, enrichedCount, enrichedBytesCount, _, _, _, _) if enriched.nonEmpty =>
         env.enrichedSink.sink(ListOfList.ofLists(enriched)) >>
-          env.metrics.addEnriched(enriched.size)
+          env.metrics.addEnriched(enrichedCount) >>
+          env.metrics.addEnrichedBytes(enrichedBytesCount)
       case _ =>
         Sync[F].unit
     }
@@ -298,7 +417,7 @@ object Processing {
     batch: Serialized
   ): F[Unit] =
     batch match {
-      case Serialized(_, failed, _, _, _) if failed.nonEmpty =>
+      case Serialized(_, _, _, failed, _, _, _) if failed.nonEmpty =>
         env.failedSink match {
           case Some(sink) => sink.sink(ListOfList.ofLists(failed)) >> env.metrics.addFailed(failed.size)
           case _ => Sync[F].unit
@@ -312,7 +431,7 @@ object Processing {
     batch: Serialized
   ): F[Unit] =
     batch match {
-      case Serialized(_, _, bad, _, _) if bad.nonEmpty =>
+      case Serialized(_, _, _, _, bad, _, _) if bad.nonEmpty =>
         env.badSink.sink(bad) >> env.metrics.addBad(bad.asIterable.size)
       case _ =>
         Sync[F].unit

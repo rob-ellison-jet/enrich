@@ -43,11 +43,7 @@ object SchemaEnrichment {
       case "struct" => Right(Some(Schemas.structSchema))
       case "transaction" => Right(Some(Schemas.transactionSchema))
       case "transaction_item" => Right(Some(Schemas.transactionItemSchema))
-      case "unstruct" =>
-        event.unstruct_event match {
-          case Some(sdj) => Right(Some(sdj.schema))
-          case _ => Right(None)
-        }
+      case "unstruct" => Right(event.unstruct_event_valid_schema_key)
       case eventType =>
         val f = FailureDetails.EnrichmentFailureMessage.InputData(
           "event",

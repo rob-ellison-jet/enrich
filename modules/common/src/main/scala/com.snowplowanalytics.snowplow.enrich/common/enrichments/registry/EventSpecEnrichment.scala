@@ -11,10 +11,13 @@
 package com.snowplowanalytics.snowplow.enrich.common.enrichments.registry
 
 import java.net.URI
+import cats.Monad
 import cats.implicits._
 import cats.data.{EitherT, NonEmptyList, ValidatedNel}
 import cats.effect.{Ref, Resource, Sync}
 import com.networknt.schema.JsonSchema
+
+import scala.jdk.CollectionConverters._
 import com.snowplowanalytics.iglu.client.CirceValidator
 import io.circe.{Decoder, Encoder, Json, parser}
 import io.circe.generic.semiauto._
@@ -24,9 +27,9 @@ import com.snowplowanalytics.iglu.core.{SchemaCriterion, SchemaKey, SchemaVer, S
 import com.snowplowanalytics.iglu.core.circe.CirceIgluCodecs._
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.registry.EventSpecEnrichment.{
   isEventSpecEntity,
-  isValidAgainstSchema,
   mkSpecContext,
-  toSDJWithDefaultEventSupport
+  toSDJWithDefaultEventSupport,
+  validateAgainstSchema
 }
 import com.snowplowanalytics.snowplow.enrich.common.outputs.EnrichedEvent
 import com.snowplowanalytics.snowplow.enrich.common.utils.CirceUtils
@@ -128,14 +131,14 @@ object EventSpecEnrichment extends ParseableEnrichment {
   /** Raw JSON strings keyed by (id, version) for on-demand compilation */
   private type Archive = Map[(String, Int), String]
 
-  sealed trait LookupError
-  object LookupError {
-    case class NotFound(id: String, version: Int) extends LookupError
-    case class CompilationFailed(
-      id: String,
-      version: Int,
-      reason: String
-    ) extends LookupError
+  case class ValidationError(
+    message: String,
+    schema: Option[String] = None,
+    path: Option[String] = None
+  )
+
+  object ValidationError {
+    implicit val encoder: Encoder[ValidationError] = deriveEncoder[ValidationError].mapJson(_.dropNullValues)
   }
 
   override def parse(
@@ -184,7 +187,7 @@ object EventSpecEnrichment extends ParseableEnrichment {
       .flatMap(_.hcursor.downField("eventSpecs").as[List[EventSpec]])
       .leftMap(e => s"Failed to parse event specs file: ${e.getMessage}")
 
-  private[registry] def createFromSpecs[F[_]: Sync](eventSpecs: List[EventSpec]): F[Either[String, EventSpecEnrichment[F]]] =
+  private[enrichments] def createFromSpecs[F[_]: Sync](eventSpecs: List[EventSpec]): F[Either[String, EventSpecEnrichment[F]]] =
     buildTiers(eventSpecs) match {
       case Right((inferenceLookup, validationCache, archiveMap)) =>
         Ref.of[F, ValidationCache](validationCache).map { ref =>
@@ -248,21 +251,37 @@ object EventSpecEnrichment extends ParseableEnrichment {
     }
   }
 
-  private def isValidAgainstSchema(
+  /**
+   * Validate JSON data against a compiled schema. Returns an empty list if the data is valid,
+   * or a list of structured errors if not. Inference uses `.isEmpty` for a cheap boolean check;
+   * validation passes the errors through to the derived context.
+   */
+  private def validateAgainstSchema(
     data: Json,
     schema: JsonSchema,
+    schemaKey: SchemaKey,
     maxJsonDepth: Int
-  ): Boolean =
-    (for {
-      jacksonJson <- circeToJackson(data, maxJsonDepth).toOption
-    } yield schema.validate(jacksonJson).isEmpty).getOrElse(false)
+  ): List[ValidationError] =
+    circeToJackson(data, maxJsonDepth) match {
+      case Left(err) =>
+        List(ValidationError(err.toString, schemaKey.toSchemaUri.some))
+      case Right(jacksonJson) =>
+        val messages = schema.validate(jacksonJson)
+        if (messages.isEmpty) List.empty
+        else
+          messages.asScala.toList.map { m =>
+            ValidationError(m.getMessage, schemaKey.toSchemaUri.some, Option(m.getInstanceLocation).map(_.toString))
+          }
+    }
 
   private val eventSpecSchemaKey =
     SchemaKey("com.snowplowanalytics.snowplow", "event_specification", "jsonschema", SchemaVer.Full(1, 0, 4))
+  private val validationSchemaKey =
+    SchemaKey("com.snowplowanalytics.snowplow", "event_specification_validation", "jsonschema", SchemaVer.Full(1, 0, 0))
   private val pagePingSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "page_ping", "jsonschema", SchemaVer.Full(1, 0, 0))
   private val pageViewSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "page_view", "jsonschema", SchemaVer.Full(1, 0, 0))
 
-  private def isEventSpecEntity(schema: SchemaKey): Boolean =
+  private[enrichments] def isEventSpecEntity(schema: SchemaKey): Boolean =
     schema.vendor === eventSpecSchemaKey.vendor && schema.name === eventSpecSchemaKey.name
 
   /**
@@ -328,13 +347,42 @@ object EventSpecEnrichment extends ParseableEnrichment {
         ).flatten: _*
       )
     )
+
+  private def mkInvalidContext(errors: List[ValidationError]): SelfDescribingData[Json] =
+    SelfDescribingData(validationSchemaKey, Json.obj("isValid" -> false.asJson, "errors" -> errors.asJson))
 }
 
-class EventSpecEnrichment[F[_]: Sync] private (
+class EventSpecEnrichment[F[_]: Monad] private (
   eventSpecs: EventSpecEnrichment.EventSpecLookup,
   validationCacheRef: Ref[F, EventSpecEnrichment.ValidationCache],
   archive: EventSpecEnrichment.Archive
 ) {
+
+  /**
+   * Entry point called by EnrichmentManager for every event.
+   *
+   * Routes between two paths based on the event's contexts:
+   * - No event_specification context → inference (match event against known specs)
+   * - event_specification context with version → validation (check event against that specific spec version)
+   * - event_specification context without version → skip (legacy tracker, no validation possible)
+   */
+  def processEvent(event: EnrichedEvent, maxJsonDepth: Int): F[List[SelfDescribingData[Json]]] = {
+    val specContext = event.contexts.find(c => isEventSpecEntity(c.schema))
+
+    specContext.fold(
+      Monad[F].pure(inferEventSpec(event, maxJsonDepth))
+    ) { ctx =>
+      val versionOpt = for {
+        id <- ctx.data.hcursor.get[String]("id").toOption
+        version <- ctx.data.hcursor.get[Int]("version").toOption
+      } yield (id, version)
+
+      versionOpt.fold(Monad[F].pure(List.empty[SelfDescribingData[Json]])) {
+        case (specId, specVersion) =>
+          validateEventSpec(event, specId, specVersion, maxJsonDepth)
+      }
+    }
+  }
 
   /**
    * Infer the event spec of an incoming event
@@ -344,7 +392,7 @@ class EventSpecEnrichment[F[_]: Sync] private (
    * This method runs on **every** event, so it should be as efficient as possible, and it should
    * make use of the pre-prepared `EventSpecLookup` which is optimized for fast lookups.
    */
-  def inferEventSpec(event: EnrichedEvent, maxJsonDepth: Int): List[SelfDescribingData[Json]] = {
+  private[registry] def inferEventSpec(event: EnrichedEvent, maxJsonDepth: Int): List[SelfDescribingData[Json]] = {
     val entitiesKeys = event.contexts.map(_.schema).toSet
     (for {
       // skip the inference if event is declaring it belongs to an event spec (snowtype or manual)
@@ -363,14 +411,14 @@ class EventSpecEnrichment[F[_]: Sync] private (
                       ) Some {
                         val entitiesMap = event.contexts.groupBy(_.schema)
                         specsCandidates.filter { spec =>
-                          spec.constraint.forall(c => isValidAgainstSchema(sdj.data, c, maxJsonDepth)) &&
+                          spec.constraint.forall(c => validateAgainstSchema(sdj.data, c, sdj.schema, maxJsonDepth).isEmpty) &&
                           spec.entities.forall { entity =>
                             val relevantEntities = entitiesMap.getOrElse(entity.schemaKey, List.empty)
                             relevantEntities.size >= entity.minCardinality.getOrElse(0) &&
                             relevantEntities.size <= entity.maxCardinality.getOrElse(Int.MaxValue) &&
                             relevantEntities.forall { en =>
                               entity.constraint.forall { c =>
-                                isValidAgainstSchema(en.data, c, maxJsonDepth)
+                                validateAgainstSchema(en.data, c, entity.schemaKey, maxJsonDepth).isEmpty
                               }
                             }
                           }
@@ -385,10 +433,10 @@ class EventSpecEnrichment[F[_]: Sync] private (
    * against the tiers built from the backend's S3 config file.
    * If not found in cache, check the archive and promote (compile + add to cache) on hit.
    */
-  def lookupInCache(id: String, version: Int): F[Either[EventSpecEnrichment.LookupError, EventSpecEnrichment.EventSpecCompiled]] =
+  def lookupInCache(id: String, version: Int): F[Either[EventSpecEnrichment.ValidationError, EventSpecEnrichment.EventSpecCompiled]] =
     validationCacheRef.get.flatMap { cache =>
       cache.get((id, version)) match {
-        case Some(hit) => Sync[F].pure(hit.asRight)
+        case Some(hit) => Monad[F].pure(hit.asRight)
         case None =>
           archive.get((id, version)) match {
             case Some(raw) =>
@@ -400,12 +448,84 @@ class EventSpecEnrichment[F[_]: Sync] private (
                 case Right(c) =>
                   validationCacheRef.update(_ + ((id, version) -> c)).as(c.asRight)
                 case Left(reason) =>
-                  Sync[F].pure(EventSpecEnrichment.LookupError.CompilationFailed(id, version, reason).asLeft)
+                  Monad[F].pure(
+                    EventSpecEnrichment
+                      .ValidationError(s"Event spec compilation failed: id=$id, version=$version, reason=$reason")
+                      .asLeft
+                  )
               }
             case None =>
-              Sync[F].pure(EventSpecEnrichment.LookupError.NotFound(id, version).asLeft)
+              Monad[F].pure(EventSpecEnrichment.ValidationError(s"Event spec not found: id=$id, version=$version").asLeft)
           }
       }
+    }
+
+  /**
+   * Check event and entity constraints/cardinality against a compiled spec.
+   * Returns empty list if the event passes all checks.
+   */
+  private def collectValidationErrors(
+    event: EnrichedEvent,
+    spec: EventSpecEnrichment.EventSpecCompiled,
+    maxJsonDepth: Int
+  ): List[EventSpecEnrichment.ValidationError] = {
+    val eventConstraintErrors =
+      for {
+        c <- spec.constraint.toList
+        sdj <- toSDJWithDefaultEventSupport(event).toList
+        error <- validateAgainstSchema(sdj.data, c, sdj.schema, maxJsonDepth)
+      } yield error
+
+    val entitiesMap = event.contexts.groupBy(_.schema)
+
+    val entityErrors = spec.entities.flatMap { entity =>
+      val relevantEntities = entitiesMap.getOrElse(entity.schemaKey, List.empty)
+      val count = relevantEntities.size
+      lazy val uri = entity.schemaKey.toSchemaUri
+
+      val cardinalityErrors = List(
+        entity.minCardinality.collect {
+          case min if count < min =>
+            EventSpecEnrichment.ValidationError(s"Entity $uri: expected at least $min, found $count", uri.some)
+        },
+        entity.maxCardinality.collect {
+          case max if count > max =>
+            EventSpecEnrichment.ValidationError(s"Entity $uri: expected at most $max, found $count", uri.some)
+        }
+      ).flatten
+
+      val constraintErrors = for {
+        en <- relevantEntities
+        c <- entity.constraint.toList
+        error <- validateAgainstSchema(en.data, c, entity.schemaKey, maxJsonDepth)
+      } yield error
+
+      cardinalityErrors ++ constraintErrors
+    }
+
+    eventConstraintErrors ++ entityErrors
+  }
+
+  /**
+   * Validate an event against a specific event spec version.
+   *
+   * Only runs for events that carry an event_specification context
+   * with a version field. Looks up the spec by id and version,
+   * checking the in-memory cache first, then falling back to archived specs.
+   */
+  def validateEventSpec(
+    event: EnrichedEvent,
+    specId: String,
+    specVersion: Int,
+    maxJsonDepth: Int
+  ): F[List[SelfDescribingData[Json]]] =
+    lookupInCache(specId, specVersion).map {
+      case Right(compiled) =>
+        val errors = collectValidationErrors(event, compiled, maxJsonDepth)
+        if (errors.isEmpty) List.empty
+        else List(EventSpecEnrichment.mkInvalidContext(errors))
+      case Left(error) =>
+        List(EventSpecEnrichment.mkInvalidContext(List(error)))
     }
 
 }

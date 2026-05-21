@@ -42,6 +42,7 @@ import com.snowplowanalytics.iglu.client.resolver.Resolver
 import com.snowplowanalytics.iglu.client.resolver.registries.RegistryLookup
 
 import com.snowplowanalytics.snowplow.runtime.{AppHealth, AppInfo}
+import com.snowplowanalytics.snowplow.streams.compression.{DecompressionConfig, Decompressor}
 import com.snowplowanalytics.snowplow.streams.{
   EventProcessingConfig,
   EventProcessor,
@@ -82,6 +83,7 @@ object MockEnvironment {
     case class AddedBadCountMetric(count: Int) extends Action
     case class AddedDroppedCountMetric(count: Int) extends Action
     case class AddedInvalidCountMetric(count: Int) extends Action
+    case class AddedEnrichedBytesMetric(count: Long) extends Action
     case class SetLatencyMetric(latency: FiniteDuration) extends Action
     case class SetE2ELatencyMetric(e2eLatency: FiniteDuration) extends Action
     /* Health */
@@ -94,12 +96,14 @@ object MockEnvironment {
 
   def build(
     inputs: Stream[IO, TokenedEvents],
-    enrichmentsConfs: List[EnrichmentConf] = Nil,
-    mocks: Mocks = Mocks.default,
-    exitOnJsCompileError: Boolean = true,
-    jsAllowedJavaClasses: Set[String] = Set.empty,
-    decompressionConfig: Config.Decompression,
-    registryLookup: RegistryLookup[IO] = SpecHelpers.registryLookup
+    enrichmentsConfs: List[EnrichmentConf],
+    mocks: Mocks,
+    exitOnJsCompileError: Boolean,
+    jsAllowedJavaClasses: Set[String],
+    registryLookup: RegistryLookup[IO],
+    decompression: DecompressionConfig,
+    compression: Config.Compression,
+    sinkMaxSize: Int
   ): Resource[IO, MockEnvironment] =
     for {
       state <- Resource.eval(Ref[IO].of(Vector.empty[Action]))
@@ -131,25 +135,25 @@ object MockEnvironment {
         appHealth = testAppHealth(state),
         enrichedSink = testSink(
           mocks.enrichedSinkResponse,
-          parseEnriched,
+          parseEnrichedWithCompression(compression),
           (enriched: List[Enriched]) => state.update(_ :+ SentToEnriched(enriched))
         ),
         failedSink = Some(
           testSink(
             mocks.failedSinkResponse,
-            parseFailed,
+            parseFailed(_).map(List(_)),
             (failed: List[Failed]) => state.update(_ :+ SentToFailed(failed))
           )
         ),
         badSink = testSink(
           mocks.badSinkResponse,
-          parseBad,
+          parseBad(_).map(List(_)),
           (bad: List[Bad]) => state.update(_ :+ SentToBad(bad))
         ),
         metrics = testMetrics(state),
         cpuParallelism = 1,
         sinkParallelism = 1,
-        sinkMaxSize = 1024 * 1024,
+        sinkMaxSize = sinkMaxSize,
         adapterRegistry = testAdapterRegistry,
         enrichmentRegistry = managedRegistry,
         igluClient = igluClient,
@@ -166,7 +170,8 @@ object MockEnvironment {
         metadata = Some(testMetadataReporter(state)),
         identity = Some(testIdentityApi),
         assetsUpdatePeriod = 3.seconds,
-        decompressionConfig = decompressionConfig
+        decompression = decompression,
+        compression = compression
       )
       MockEnvironment(state, env)
     }
@@ -230,14 +235,14 @@ object MockEnvironment {
 
   private def testSink[A](
     mockedResponse: Response[Unit],
-    parse: Sinkable => IO[A],
+    parse: Sinkable => IO[List[A]],
     updateState: List[A] => IO[Unit]
   ): Sink[IO] =
     new Sink[IO] {
       override def sink(batch: ListOfList[Sinkable]): IO[Unit] =
         mockedResponse match {
           case Response.Success(_) =>
-            batch.asIterable.toList.traverse(parse).flatMap(updateState)
+            batch.asIterable.toList.flatTraverse(parse).flatMap(updateState)
           case Response.ExceptionThrown(value) =>
             IO.raiseError(value)
         }
@@ -265,6 +270,9 @@ object MockEnvironment {
       def addInvalid(count: Int): IO[Unit] =
         ref.update(_ :+ AddedInvalidCountMetric(count))
 
+      def addEnrichedBytes(count: Long): IO[Unit] =
+        ref.update(_ :+ AddedEnrichedBytesMetric(count))
+
       def setLatency(latency: FiniteDuration): IO[Unit] =
         ref.update(_ :+ SetLatencyMetric(latency))
 
@@ -283,6 +291,40 @@ object MockEnvironment {
     partitionKey: Option[String],
     attributes: Map[String, String]
   )
+
+  private def parseEnrichedWithCompression(
+    compression: Config.Compression
+  )(
+    sinkable: Sinkable
+  ): IO[List[Enriched]] =
+    if (!compression.enabled)
+      parseEnriched(sinkable).map(List(_))
+    else
+      IO.delay {
+        val buf = java.nio.ByteBuffer.wrap(sinkable.bytes)
+        val factory: Decompressor.Factory = compression.`type` match {
+          case Config.Compression.GZIP => new Decompressor.Gzip(Int.MaxValue)
+          case Config.Compression.ZSTD => new Decompressor.Zstd(Int.MaxValue)
+        }
+        factory.build(buf) match {
+          case Decompressor.FactorySuccess(d, _) => drainRecords(d)
+          case other => throw new RuntimeException(s"Can't initialize Decompressor: $other")
+        }
+      }.flatMap { records =>
+        records.traverse(bytes => parseEnriched(Sinkable(bytes, None, Map.empty)))
+      }
+
+  @scala.annotation.tailrec
+  private def drainRecords(decompressor: Decompressor, acc: List[Array[Byte]] = Nil): List[Array[Byte]] =
+    decompressor.getNextRecord match {
+      case Decompressor.Record(bytes) => drainRecords(decompressor, bytes :: acc)
+      case Decompressor.EndOfRecords =>
+        decompressor.close()
+        acc.reverse
+      case other =>
+        decompressor.close()
+        throw new RuntimeException(s"Unexpected result: $other")
+    }
 
   private def parseEnriched(sinkable: Sinkable): IO[Enriched] =
     for {

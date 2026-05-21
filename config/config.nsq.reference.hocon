@@ -389,4 +389,22 @@
     # -- This config parameter is needed to protect the app's memory.
     "maxBytesSinglePayload": 10000000
   }
+
+  # -- Configures compression of outgoing enriched events.
+  # -- Note: when compression is enabled, partition key and message attributes are not propagated,
+  # -- because multiple events are merged into a single compressed payload.
+  "compression": {
+
+    # -- When true, enriched events are compressed before being written to the good stream.
+    "enabled": false
+
+    # -- Compression algorithm to use. Supported values: "gzip", "zstd"
+    "type": "zstd"
+
+    # -- Compression level for gzip (1-9, where 9 is highest compression)
+    "gzipCompressionLevel": 6
+
+    # -- Compression level for zstd (1-22, where 22 is highest compression)
+    "zstdCompressionLevel": 9
+  }
 }

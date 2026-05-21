@@ -11,4 +11,7 @@ project/plugins/project/
 
 .bsp
 
-.claude
+.claude/*
+!.claude/skills
+!.claude/skills/**
+.claude/skills/*/tmp/

@@ -97,6 +97,7 @@ class SchemaEnrichmentSpec extends Specification with DataTables {
     val event: EnrichedEvent = new EnrichedEvent()
     event.setEvent("unstruct")
     event.unstruct_event = Some(unstruct)
+    event.unstruct_event_valid_schema_key = Some(unstruct.schema)
     event
   }
 }

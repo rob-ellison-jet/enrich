@@ -29,18 +29,14 @@ import com.comcast.ip4s.Port
 import com.snowplowanalytics.snowplow.runtime.Metrics.{PrometheusConfig, StatsdConfig}
 import com.snowplowanalytics.snowplow.runtime.{AcceptedLicense, ConfigParser, Retrying, Sentry, Telemetry}
 
-import com.snowplowanalytics.snowplow.streams.pubsub.{
-  GcpUserAgent,
-  PubsubFactoryConfig,
-  PubsubSinkConfig,
-  PubsubSinkConfigM,
-  PubsubSourceConfig
-}
+import com.snowplowanalytics.snowplow.streams.pubsub.{PubsubFactoryConfig, PubsubSinkConfig, PubsubSinkConfigM, PubsubSourceConfig}
 
 import com.snowplowanalytics.snowplow.enrich.common.SpecHelpers.{adaptersSchemas, atomicFieldLimitsDefaults}
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.AtomicFields
 import com.snowplowanalytics.snowplow.enrich.common.outputs.EnrichedEvent.atomicFieldsByName
 import com.snowplowanalytics.snowplow.enrich.common.utils.JsonPath
+
+import com.snowplowanalytics.snowplow.streams.compression.DecompressionConfig
 
 import com.snowplowanalytics.snowplow.enrich.core.Config
 
@@ -118,7 +114,7 @@ object PubsubConfigSpec {
         attributes = Nil
       )
     ),
-    streams = PubsubFactoryConfig(gcpUserAgent = GcpUserAgent("Snowplow OSS", "enrich"), None),
+    streams = PubsubFactoryConfig(None),
     cpuParallelismFraction = BigDecimal(1),
     sinkParallelismFraction = BigDecimal(2),
     monitoring = Config.Monitoring(
@@ -147,7 +143,8 @@ object PubsubConfigSpec {
     identity = None,
     blobClients = EmptyConfig(),
     adaptersSchemas = adaptersSchemas,
-    decompression = Config.Decompression(5242880, 10000000),
+    decompression = DecompressionConfig(5242880, 10000000),
+    compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6, zstdCompressionLevel = 9),
     http = Config.Http(Config.HttpClient(5.seconds)),
     iglu = Config.Iglu(2, 1.second)
   )
@@ -201,7 +198,7 @@ object PubsubConfigSpec {
         attributes = Nil
       )
     ),
-    streams = PubsubFactoryConfig(gcpUserAgent = GcpUserAgent("Snowplow OSS", "enrich"), None),
+    streams = PubsubFactoryConfig(None),
     cpuParallelismFraction = BigDecimal(1),
     sinkParallelismFraction = BigDecimal(2),
     monitoring = Config.Monitoring(
@@ -309,7 +306,8 @@ object PubsubConfigSpec {
     ),
     blobClients = EmptyConfig(),
     adaptersSchemas = adaptersSchemas,
-    decompression = Config.Decompression(5242880, 10000000),
+    decompression = DecompressionConfig(5242880, 10000000),
+    compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6, zstdCompressionLevel = 9),
     http = Config.Http(Config.HttpClient(5.seconds)),
     iglu = Config.Iglu(2, 1.second)
   )

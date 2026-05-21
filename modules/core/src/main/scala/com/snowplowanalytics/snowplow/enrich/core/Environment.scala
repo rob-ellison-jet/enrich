@@ -30,6 +30,7 @@ import com.snowplowanalytics.iglu.client.resolver.registries.{Http4sRegistryLook
 import com.snowplowanalytics.iglu.client.IgluCirceClient
 
 import com.snowplowanalytics.snowplow.streams.{Factory, Sink, SourceAndAck}
+import com.snowplowanalytics.snowplow.streams.compression.DecompressionConfig
 import com.snowplowanalytics.snowplow.runtime.{AppHealth, AppInfo, HealthProbe, Sentry}
 import com.snowplowanalytics.snowplow.enrich.common.adapters.AdapterRegistry
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.EnrichmentRegistry
@@ -73,7 +74,8 @@ case class Environment[F[_]](
   metadata: Option[MetadataReporter[F]],
   identity: Option[Identity.Api[F]],
   assetsUpdatePeriod: FiniteDuration,
-  decompressionConfig: Config.Decompression
+  decompression: DecompressionConfig,
+  compression: Config.Compression
 ) {
   def badRowProcessor = BadRowProcessor(appInfo.name, appInfo.version)
 }
@@ -177,7 +179,8 @@ object Environment {
       metadata = metadata,
       assetsUpdatePeriod = config.main.assetsUpdatePeriod,
       identity = identity,
-      decompressionConfig = config.main.decompression
+      decompression = config.main.decompression,
+      compression = config.main.compression
     )
 
   private def mkResolver[F[_]: Async](resolverConfig: Resolver.ResolverConfig): Resource[F, Resolver[F]] =

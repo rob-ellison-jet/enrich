@@ -28,6 +28,7 @@ trait Metrics[F[_]] {
   def addBad(count: Int): F[Unit]
   def addDropped(count: Int): F[Unit]
   def addInvalid(count: Int): F[Unit]
+  def addEnrichedBytes(count: Long): F[Unit]
   def setLatency(latency: FiniteDuration): F[Unit]
   def setE2ELatency(latency: FiniteDuration): F[Unit]
 
@@ -46,6 +47,7 @@ object Metrics {
         bad <- entries.counter("bad")
         dropped <- entries.counter("dropped")
         invalid <- entries.counter("invalid_enriched")
+        enrichedBytes <- entries.counter("good_bytes")
         latency <- entries.timer("latency_millis", sourceAndAck.currentStreamLatency)
         e2eLatency <- entries.timer("e2e_latency_millis", Sync[F].pure(None))
       } yield new Metrics[F] {
@@ -55,6 +57,7 @@ object Metrics {
         def addBad(count: Int): F[Unit] = bad.add(count.toLong)
         def addDropped(count: Int): F[Unit] = dropped.add(count.toLong)
         def addInvalid(count: Int): F[Unit] = invalid.add(count.toLong)
+        def addEnrichedBytes(count: Long): F[Unit] = enrichedBytes.add(count)
         def setLatency(l: FiniteDuration): F[Unit] = latency.record(l)
         def setE2ELatency(l: FiniteDuration): F[Unit] = e2eLatency.record(l)
 

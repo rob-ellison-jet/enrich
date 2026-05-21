@@ -39,7 +39,7 @@ object Dependencies {
     val jsonsmart = "2.5.2"
     val iabClient = "0.3.1"
     val ipaddress = "5.5.1"
-    val yauaa = "7.30.0"
+    val yauaa = "8.1.1"
     val log4jToSlf4j = "2.18.0"
     val guava = "33.1.0-jre"
     val slf4j = "2.0.3"
@@ -69,7 +69,7 @@ object Dependencies {
 
     val gcpSdk = "2.60.0"
     val awsSdk = "2.33.1"
-    val kafka = "4.1.1"
+    val kafka = "4.1.2"
     val jackson = "2.21.2"
 
     val decline = "2.4.1"
@@ -82,7 +82,7 @@ object Dependencies {
     val reactorNetty = "1.2.13"
     val http4s = "0.23.25"
 
-    val streams = "0.22.0"
+    val streams = "0.24.0"
 
     val specs2 = "4.20.3"
     val specs2Cats = "4.20.3"

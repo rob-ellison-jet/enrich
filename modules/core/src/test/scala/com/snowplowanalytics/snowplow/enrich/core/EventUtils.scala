@@ -151,7 +151,11 @@ object EventUtils {
         event = Some(unstructType.full),
         user_ipaddress = Some(EventUtils.ip),
         derived_tstamp = Some(collectorTstamp),
-        derived_contexts = Contexts(List(failureAddToCart))
+        derived_contexts = Contexts(List(failureAddToCart)),
+        event_vendor = Some("com.snowplowanalytics.snowplow"),
+        event_name = Some("add_to_cart"),
+        event_format = Some("jsonschema"),
+        event_version = Some("1-0-0")
       )
 
   def expectedFailedJavascript(eventId: UUID) =
@@ -210,6 +214,10 @@ object EventUtils {
     enriched.user_ipaddress = ip
     enriched.derived_contexts = List(failureAddToCart)
     enriched.derived_tstamp = enriched.collector_tstamp
+    enriched.event_vendor = "com.snowplowanalytics.snowplow"
+    enriched.event_name = "add_to_cart"
+    enriched.event_format = "jsonschema"
+    enriched.event_version = "1-0-0"
 
     val raw = Payload.RawEvent(
       vendor = vendor,

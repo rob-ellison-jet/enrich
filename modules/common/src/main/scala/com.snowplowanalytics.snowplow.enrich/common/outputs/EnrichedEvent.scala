@@ -253,6 +253,11 @@ class EnrichedEvent extends Serializable {
   private[enrich] var unstruct_event_got_updated = false
   private[enrich] var contexts_got_updated = false
 
+  // Schema key of an unstruct event. Unlike `unstruct_event`, which is only set when event data also passes validation,
+  // this field is set for both valid events and events whose data fails to conform to an IgluSchema.
+  // It remains None when the schema itself cannot be resolved.
+  private[enrich] var unstruct_event_valid_schema_key: Option[SchemaKey] = None
+
   // Specifies whether derived contexts only from JS enrichment should be used
   // and all the other derived contexts should be ignored
   private[enrich] var use_derived_contexts_from_js_enrichment_only: JBoolean = _
@@ -328,6 +333,7 @@ object EnrichedEvent {
           "unstruct_event",
           "derived_contexts",
           "unstruct_event_got_updated",
+          "unstruct_event_valid_schema_key",
           "contexts_got_updated",
           "use_derived_contexts_from_js_enrichment_only"
         ).contains(f.getName)

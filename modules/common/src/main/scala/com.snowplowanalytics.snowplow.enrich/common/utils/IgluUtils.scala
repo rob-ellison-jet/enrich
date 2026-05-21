@@ -61,7 +61,9 @@ object IgluUtils {
     validationInfo: Option[ValidationInfo]
   )
 
-  case class Unstruct(unstruct: ValidSDJ)
+  sealed trait UnstructResult
+  case class ValidUnstruct(unstruct: ValidSDJ) extends UnstructResult
+  case class InvalidUnstruct(schemaKey: SchemaKey) extends UnstructResult
 
   case class Contexts(contexts: NonEmptyList[ValidSDJ])
 
@@ -90,8 +92,9 @@ object IgluUtils {
   )
 
   /**
-   * Parse and validate unstruct event and contexts, if any
-   * @return `SchemaViolation`s accumulated in the log. Valid unstruct event and valid contexts in the value.
+   * Parse and validate unstruct event and contexts, if any.
+   * @return `SchemaViolation`s accumulated in the log. `UnstructResult` and valid contexts in the
+   *         value; each is None if absent or if the schema could not be resolved.
    */
   def parseAndValidateInput[F[_]: Sync](
     input: EventExtractInput,
@@ -99,15 +102,17 @@ object IgluUtils {
     registryLookup: RegistryLookup[F],
     maxJsonDepth: Int,
     etlTstamp: Instant
-  ): WriterT[F, List[Failure.SchemaViolation], (Option[Unstruct], Option[Contexts])] =
+  ): WriterT[F, List[Failure.SchemaViolation], (Option[UnstructResult], Option[Contexts])] =
     for {
       unstruct <- parseAndValidateUnstruct(input.unstructEvent, client, registryLookup, maxJsonDepth, etlTstamp)
       contexts <- parseAndValidateContexts(input.contexts, client, registryLookup, maxJsonDepth, etlTstamp)
     } yield (unstruct, contexts)
 
   /**
-   * Parse and validate unstruct event, if any
-   * @return `SchemaViolation`s accumulated in the log. Valid unstruct event in the value, or None if absent/invalid.
+   * Parse and validate unstruct event, if any.
+   * @return `SchemaViolation`s accumulated in the log. `ValidUnstruct` if the event data conforms
+   *         to its schema, `InvalidUnstruct` if the schema was resolved but data is invalid,
+   *         or None if the event is absent or the schema could not be resolved.
    */
   private[common] def parseAndValidateUnstruct[F[_]: Sync](
     maybeUnstruct: Option[String],
@@ -115,25 +120,36 @@ object IgluUtils {
     registryLookup: RegistryLookup[F],
     maxJsonDepth: Int,
     etlTstamp: Instant
-  ): WriterT[F, List[Failure.SchemaViolation], Option[Unstruct]] =
+  ): WriterT[F, List[Failure.SchemaViolation], Option[UnstructResult]] =
     maybeUnstruct match {
       case Some(unstructStr) =>
         val field = "unstruct"
         val criterion = SchemaCriterion("com.snowplowanalytics.snowplow", "unstruct_event", "jsonschema", 1, 0)
 
         WriterT {
-          val result = for {
-            json <- extractInputData(unstructStr, field, criterion, client, registryLookup, maxJsonDepth, etlTstamp)
-            valid <- decodeAndValidateSDJ(json, client, registryLookup, field, etlTstamp)
-          } yield Unstruct(valid).some
-
-          result.value.map {
-            case Right(unstruct) => (Nil, unstruct)
-            case Left(error) => (List(error), None)
+          extractInputData(unstructStr, field, criterion, client, registryLookup, maxJsonDepth, etlTstamp).value.flatMap {
+            case Left(outerError) =>
+              Sync[F].pure((List(outerError), Option.empty[UnstructResult]))
+            case Right(innerJson) =>
+              decodeAndValidateSDJ(innerJson, client, registryLookup, field, etlTstamp).value.map {
+                case Right(valid) =>
+                  (Nil, Option[UnstructResult](ValidUnstruct(valid)))
+                case Left(innerError) =>
+                  val maybeResult: Option[UnstructResult] = innerError.schemaViolation match {
+                    case FailureDetails.SchemaViolation.IgluError(key, ve: ClientError.ValidationError) =>
+                      val resolvedKey = ve.supersededBy
+                        .flatMap(v => SchemaVer.parseFull(v).toOption)
+                        .fold(key)(ver => key.copy(version = ver))
+                      Some(InvalidUnstruct(resolvedKey))
+                    case _ =>
+                      None
+                  }
+                  (List(innerError), maybeResult)
+              }
           }
         }
       case None =>
-        WriterT(Sync[F].pure((List.empty[Failure.SchemaViolation], Option.empty[Unstruct])))
+        WriterT(Sync[F].pure((List.empty[Failure.SchemaViolation], Option.empty[UnstructResult])))
     }
 
   /**

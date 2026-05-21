@@ -46,6 +46,8 @@ import com.snowplowanalytics.snowplow.enrich.common.enrichments.AtomicFields
 import com.snowplowanalytics.snowplow.enrich.common.outputs.EnrichedEvent.atomicFieldsByName
 import com.snowplowanalytics.snowplow.enrich.common.utils.JsonPath
 
+import com.snowplowanalytics.snowplow.streams.compression.DecompressionConfig
+
 import com.snowplowanalytics.snowplow.enrich.core.Config
 
 class KinesisConfigSpec extends Specification with CatsEffect {
@@ -177,7 +179,8 @@ object KinesisConfigSpec {
     identity = None,
     blobClients = EmptyConfig(),
     adaptersSchemas = adaptersSchemas,
-    decompression = Config.Decompression(5242880, 10000000),
+    decompression = DecompressionConfig(5242880, 10000000),
+    compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6, zstdCompressionLevel = 9),
     http = Config.Http(Config.HttpClient(5.seconds)),
     iglu = Config.Iglu(2, 1.second)
   )
@@ -354,7 +357,8 @@ object KinesisConfigSpec {
     ),
     blobClients = EmptyConfig(),
     adaptersSchemas = adaptersSchemas,
-    decompression = Config.Decompression(5242880, 10000000),
+    decompression = DecompressionConfig(5242880, 10000000),
+    compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6, zstdCompressionLevel = 9),
     http = Config.Http(Config.HttpClient(5.seconds)),
     iglu = Config.Iglu(2, 1.second)
   )

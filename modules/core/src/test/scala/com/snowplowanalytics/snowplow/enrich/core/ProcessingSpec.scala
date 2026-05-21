@@ -37,6 +37,7 @@ import com.snowplowanalytics.iglu.core.SchemaList
 import io.circe.Json
 
 import com.snowplowanalytics.snowplow.streams.TokenedEvents
+import com.snowplowanalytics.snowplow.streams.compression.DecompressionConfig
 
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.registry.EnrichmentConf
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.registry.{IpLookupsEnrichment, JavascriptScriptEnrichment}
@@ -68,6 +69,11 @@ class ProcessingSpec extends Specification with CatsEffect {
     Split compressed batch when exceeding maxBytesInBatch limit $e13
     Emit bad rows for compressed payloads exceeding maxBytesSinglePayload limit $e14
     Crash with IgluSystemError when Iglu Server is unavailable during schema validation $e15
+    Compress enriched output with GZIP $e16
+    Compress enriched output with ZSTD $e17
+    Compress enriched output into multiple batches when maxRecordSize is exceeded $e18
+    Emit size violation bad rows for enriched events that exceed maxRecordSize after compression $e19
+    Exclude bytes of size-violation records from good_bytes on a mixed batch $e20
   """
 
   def e1 = {
@@ -104,6 +110,7 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched),
                              Action.AddedEnrichedCountMetric(2),
+                             Action.AddedEnrichedBytesMetric(698),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMinutes, MINUTES)),
                              Action.Checkpointed(List(token))
                            )
@@ -267,6 +274,7 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched),
                              Action.AddedEnrichedCountMetric(1),
+                             Action.AddedEnrichedBytesMetric(349),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMinutes, MINUTES)),
                              Action.Checkpointed(List(token))
                            )
@@ -371,6 +379,7 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched),
                              Action.AddedEnrichedCountMetric(1),
+                             Action.AddedEnrichedBytesMetric(548),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMinutes, MINUTES)),
                              Action.Checkpointed(List(token))
                            )
@@ -563,12 +572,14 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched(etlTstamps.head, "Fuyu")),
                              Action.AddedEnrichedCountMetric(1),
+                             Action.AddedEnrichedBytesMetric(392),
                              Action.SetE2ELatencyMetric(Duration(etlLatencies.head.toMicros, MICROSECONDS)),
                              Action.Checkpointed(List(token1)),
                              Action.AddedRawCountMetric(1),
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched(etlTstamps.last, "Changchun")),
                              Action.AddedEnrichedCountMetric(1),
+                             Action.AddedEnrichedBytesMetric(397),
                              Action.SetE2ELatencyMetric(Duration(etlLatencies.last.toMicros, MICROSECONDS)),
                              Action.Checkpointed(List(token2))
                            )
@@ -628,6 +639,7 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched),
                              Action.AddedEnrichedCountMetric(3),
+                             Action.AddedEnrichedBytesMetric(1047),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMinutes, MINUTES)),
                              Action.Checkpointed(List(token))
                            )
@@ -678,6 +690,7 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(expectedEnriched),
                              Action.AddedEnrichedCountMetric(2),
+                             Action.AddedEnrichedBytesMetric(698),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMinutes, MINUTES)),
                              Action.Checkpointed(List(token))
                            )
@@ -845,8 +858,8 @@ class ProcessingSpec extends Specification with CatsEffect {
         token <- IO.unique
         inputStream = mkCompressedStream((input, token))
         // Use very small maxBytesInBatch to force splitting of the decompressed payloads
-        smallBatchConfig = Config.Decompression(maxBytesSinglePayload = 10000000, maxBytesInBatch = 1000)
-        assertion <- runTest(etlTstamp, inputStream, decompressionConfig = smallBatchConfig) {
+        smallBatchConfig = DecompressionConfig(maxBytesSinglePayload = 10000000, maxBytesInBatch = 1000)
+        assertion <- runTest(etlTstamp, inputStream, decompression = smallBatchConfig) {
                        case control =>
                          for {
                            _ <- Processing.stream(control.environment).compile.drain
@@ -857,11 +870,13 @@ class ProcessingSpec extends Specification with CatsEffect {
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(List(expectedEnriched.head)),
                              Action.AddedEnrichedCountMetric(1),
+                             Action.AddedEnrichedBytesMetric(349),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMicros, MICROSECONDS)),
                              Action.AddedRawCountMetric(1), // Second payload processed
                              Action.AddedMetadata(expectedMetadata),
                              Action.SentToEnriched(List(expectedEnriched(1))),
                              Action.AddedEnrichedCountMetric(1),
+                             Action.AddedEnrichedBytesMetric(349),
                              Action.SetE2ELatencyMetric(Duration(etlLatency.toMicros, MICROSECONDS)),
                              Action.Checkpointed(List(token)) // Token attached to final result
                            )
@@ -910,7 +925,7 @@ class ProcessingSpec extends Specification with CatsEffect {
           expectedBadSizeViolation(
             maxSize,
             actualCompressedSize,
-            s"Collector payload will exceed maximum allowed size of $maxSize after Gzip decompression",
+            s"Payload will exceed maximum allowed size of $maxSize after gzip decompression",
             base64Payload
           ),
           None,
@@ -922,8 +937,8 @@ class ProcessingSpec extends Specification with CatsEffect {
       for {
         token <- IO.unique
         inputStream = mkCompressedStream((input, token))
-        restrictiveConfig = Config.Decompression(maxBytesSinglePayload = maxSize, maxBytesInBatch = 10000000)
-        assertion <- runTest(etlTstamp, inputStream, decompressionConfig = restrictiveConfig) {
+        restrictiveConfig = DecompressionConfig(maxBytesSinglePayload = maxSize, maxBytesInBatch = 10000000)
+        assertion <- runTest(etlTstamp, inputStream, decompression = restrictiveConfig) {
                        case control =>
                          for {
                            _ <- Processing.stream(control.environment).compile.drain
@@ -976,6 +991,232 @@ class ProcessingSpec extends Specification with CatsEffect {
     TestControl.executeEmbed(io)
   }
 
+  def e16 = {
+    val eventId1 = UUID.randomUUID
+    val eventId2 = UUID.randomUUID
+
+    val input = GoodBatch(List(pageView(eventId1), pageView(eventId2)))
+
+    val expectedEnriched =
+      List(
+        Enriched(expectedPageView(eventId1), None, Map.empty),
+        Enriched(expectedPageView(eventId2), None, Map.empty)
+      )
+
+    val gzipCompression = Config.Compression(
+      enabled = true,
+      `type` = Config.Compression.GZIP,
+      gzipCompressionLevel = 6,
+      zstdCompressionLevel = 9
+    )
+
+    val io =
+      for {
+        token <- IO.unique
+        inputStream = mkGoodStream((input, token))
+        assertion <- runTest(etlTstamp, inputStream, compression = gzipCompression) {
+                       case control =>
+                         for {
+                           _ <- Processing.stream(control.environment).compile.drain
+                           state <- control.state.get
+                         } yield {
+                           val enrichedActions = state.collect { case Action.SentToEnriched(enriched) => enriched }.flatten.toList
+                           val enrichedMetrics = state.collect { case Action.AddedEnrichedCountMetric(n) => n }.sum
+                           val enrichedBytesMetric = state.collect { case Action.AddedEnrichedBytesMetric(n) => n }.sum
+                           (enrichedActions must containTheSameElementsAs(expectedEnriched)) and
+                             (enrichedMetrics must beEqualTo(2)) and // For one compressed record
+                             (enrichedBytesMetric must beEqualTo(698L))
+                         }
+                     }
+      } yield assertion
+
+    TestControl.executeEmbed(io)
+  }
+
+  def e17 = {
+    val eventId1 = UUID.randomUUID
+    val eventId2 = UUID.randomUUID
+
+    val input = GoodBatch(List(pageView(eventId1), pageView(eventId2)))
+
+    val expectedEnriched =
+      List(
+        Enriched(expectedPageView(eventId1), None, Map.empty),
+        Enriched(expectedPageView(eventId2), None, Map.empty)
+      )
+
+    val zstdCompression = Config.Compression(
+      enabled = true,
+      `type` = Config.Compression.ZSTD,
+      gzipCompressionLevel = 6,
+      zstdCompressionLevel = 9
+    )
+
+    val io =
+      for {
+        token <- IO.unique
+        inputStream = mkGoodStream((input, token))
+        assertion <- runTest(etlTstamp, inputStream, compression = zstdCompression) {
+                       case control =>
+                         for {
+                           _ <- Processing.stream(control.environment).compile.drain
+                           state <- control.state.get
+                         } yield {
+                           val enrichedActions = state.collect { case Action.SentToEnriched(enriched) => enriched }.flatten.toList
+                           val enrichedMetrics = state.collect { case Action.AddedEnrichedCountMetric(n) => n }.sum
+                           val enrichedBytesMetric = state.collect { case Action.AddedEnrichedBytesMetric(n) => n }.sum
+                           (enrichedActions must containTheSameElementsAs(expectedEnriched)) and
+                             (enrichedMetrics must beEqualTo(2)) and // For one compressed record
+                             (enrichedBytesMetric must beEqualTo(698L))
+                         }
+                     }
+      } yield assertion
+
+    TestControl.executeEmbed(io)
+  }
+
+  def e18 = {
+    // Use 3 events with a small sinkMaxSize to force splitting into multiple compressed batches.
+    // sinkMaxSize = 300 bytes is large enough to hold one compressed event (typically ~150-250 bytes
+    // including the 6-byte compressor overhead) but too small to hold three events in the same batch.
+    val eventId1 = UUID.randomUUID
+    val eventId2 = UUID.randomUUID
+    val eventId3 = UUID.randomUUID
+
+    val input = GoodBatch(List(pageView(eventId1), pageView(eventId2), pageView(eventId3)))
+
+    val expectedEnriched =
+      List(
+        Enriched(expectedPageView(eventId1), None, Map.empty),
+        Enriched(expectedPageView(eventId2), None, Map.empty),
+        Enriched(expectedPageView(eventId3), None, Map.empty)
+      )
+
+    val gzipCompression = Config.Compression(
+      enabled = true,
+      `type` = Config.Compression.GZIP,
+      gzipCompressionLevel = 6,
+      zstdCompressionLevel = 9
+    )
+
+    val io =
+      for {
+        token <- IO.unique
+        inputStream = mkGoodStream((input, token))
+        assertion <- runTest(etlTstamp, inputStream, compression = gzipCompression, sinkMaxSize = 300) {
+                       case control =>
+                         for {
+                           _ <- Processing.stream(control.environment).compile.drain
+                           state <- control.state.get
+                         } yield {
+                           val enrichedActions = state.collect { case Action.SentToEnriched(enriched) => enriched }.flatten.toList
+                           val enrichedMetrics = state.collect { case Action.AddedEnrichedCountMetric(n) => n }.sum
+                           val enrichedBytesMetric = state.collect { case Action.AddedEnrichedBytesMetric(n) => n }.sum
+                           (enrichedActions must containTheSameElementsAs(expectedEnriched)) and
+                             (enrichedMetrics must beEqualTo(3)) and
+                             (enrichedBytesMetric must beEqualTo(1047L))
+                         }
+                     }
+      } yield assertion
+
+    TestControl.executeEmbed(io)
+  }
+
+  def e19 = {
+    // Use a sinkMaxSize smaller than any compressed event to force all events into size violation bad rows.
+    val eventId1 = UUID.randomUUID
+    val eventId2 = UUID.randomUUID
+
+    val input = GoodBatch(List(pageView(eventId1), pageView(eventId2)))
+
+    val gzipCompression = Config.Compression(
+      enabled = true,
+      `type` = Config.Compression.GZIP,
+      gzipCompressionLevel = 6,
+      zstdCompressionLevel = 9
+    )
+
+    val io =
+      for {
+        token <- IO.unique
+        inputStream = mkGoodStream((input, token))
+        assertion <- runTest(etlTstamp, inputStream, compression = gzipCompression, sinkMaxSize = 50) {
+                       case control =>
+                         for {
+                           _ <- Processing.stream(control.environment).compile.drain
+                           state <- control.state.get
+                         } yield {
+                           val enrichedActions = state.collect { case Action.SentToEnriched(enriched) => enriched }.flatten.toList
+                           val badActions = state.collect { case Action.SentToBad(bads) => bads }.flatten.toList
+                           val enrichedMetrics = state.collect { case Action.AddedEnrichedCountMetric(n) => n }.sum
+                           val enrichedBytesActions = state.collect { case Action.AddedEnrichedBytesMetric(n) => n }
+                           (enrichedActions must beEmpty) and
+                             (badActions must haveSize(2)) and
+                             (enrichedMetrics must beEqualTo(0)) and
+                             (enrichedBytesActions must beEmpty) and
+                             (badActions.head.bad.compact must contain("exceeds the maximum allowed size of 50 bytes after compression"))
+                         }
+                     }
+      } yield assertion
+
+    TestControl.executeEmbed(io)
+  }
+
+  def e20 = {
+    // Mixed batch exercises the size-violation exclusion arm: the metric must
+    // reflect only the good records' bytes, not the oversized one.
+    val eventId1 = UUID.randomUUID
+    val eventId2 = UUID.randomUUID
+    val eventIdBig = UUID.randomUUID
+
+    // `page` → `page_title` (2000-char limit, not URL-parsed). Random UUID hex
+    // resists gzip enough that the ~1944-char value stays > 700 bytes compressed.
+    val bigTitle = (1 to 54).map(_ => UUID.randomUUID.toString).mkString
+    val oversizedPayload = pageView(eventIdBig).copy(
+      querystring = pageView(eventIdBig).querystring ++ List(
+        new org.apache.http.message.BasicNameValuePair("page", bigTitle)
+      )
+    )
+
+    val input = GoodBatch(List(pageView(eventId1), pageView(eventId2), oversizedPayload))
+
+    val expectedEnriched =
+      List(
+        Enriched(expectedPageView(eventId1), None, Map.empty),
+        Enriched(expectedPageView(eventId2), None, Map.empty)
+      )
+
+    val gzipCompression = Config.Compression(
+      enabled = true,
+      `type` = Config.Compression.GZIP,
+      gzipCompressionLevel = 6,
+      zstdCompressionLevel = 9
+    )
+
+    val io =
+      for {
+        token <- IO.unique
+        inputStream = mkGoodStream((input, token))
+        assertion <- runTest(etlTstamp, inputStream, compression = gzipCompression, sinkMaxSize = 700) {
+                       case control =>
+                         for {
+                           _ <- Processing.stream(control.environment).compile.drain
+                           state <- control.state.get
+                         } yield {
+                           val enrichedActions = state.collect { case Action.SentToEnriched(enriched) => enriched }.flatten.toList
+                           val badActions = state.collect { case Action.SentToBad(bads) => bads }.flatten.toList
+                           val enrichedBytesMetric = state.collect { case Action.AddedEnrichedBytesMetric(n) => n }.sum
+                           (enrichedActions must containTheSameElementsAs(expectedEnriched)) and
+                             (badActions must haveSize(1)) and
+                             (enrichedBytesMetric must beEqualTo(698L)) and
+                             (badActions.head.bad.compact must contain("exceeds the maximum allowed size of 700 bytes after compression"))
+                         }
+                     }
+      } yield assertion
+
+    TestControl.executeEmbed(io)
+  }
+
 }
 
 object ProcessingSpec {
@@ -985,8 +1226,11 @@ object ProcessingSpec {
     enrichmentsConfs: List[EnrichmentConf] = Nil,
     mocks: Mocks = Mocks.default,
     exitOnJsCompileError: Boolean = true,
-    decompressionConfig: Config.Decompression = Config.Decompression(10000000, 10000000),
-    registryLookup: RegistryLookup[IO] = SpecHelpers.registryLookup
+    decompression: DecompressionConfig = DecompressionConfig(10000000, 10000000),
+    compression: Config.Compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6,
+      zstdCompressionLevel = 9),
+    registryLookup: RegistryLookup[IO] = SpecHelpers.registryLookup,
+    sinkMaxSize: Int = 1024 * 1024
   )(
     f: MockEnvironment => IO[A]
   ): IO[A] =
@@ -998,8 +1242,10 @@ object ProcessingSpec {
           mocks,
           exitOnJsCompileError,
           Set.empty,
-          decompressionConfig,
-          registryLookup
+          registryLookup,
+          decompression,
+          compression,
+          sinkMaxSize
         )
         .use { env =>
           f(env)

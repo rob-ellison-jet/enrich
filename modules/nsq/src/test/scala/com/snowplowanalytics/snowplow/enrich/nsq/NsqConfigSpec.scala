@@ -38,6 +38,8 @@ import com.snowplowanalytics.snowplow.enrich.common.utils.JsonPath
 
 import com.snowplowanalytics.snowplow.enrich.cloudutils.azure.AzureStorageConfig
 
+import com.snowplowanalytics.snowplow.streams.compression.DecompressionConfig
+
 import com.snowplowanalytics.snowplow.enrich.core.Config
 
 class NsqConfigSpec extends Specification with CatsEffect {
@@ -141,7 +143,8 @@ object NsqConfigSpec {
     identity = None,
     blobClients = AzureStorageConfig(Nil),
     adaptersSchemas = adaptersSchemas,
-    decompression = Config.Decompression(5242880, 10000000),
+    decompression = DecompressionConfig(5242880, 10000000),
+    compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6, zstdCompressionLevel = 9),
     http = Config.Http(Config.HttpClient(5.seconds)),
     iglu = Config.Iglu(2, 1.second)
   )
@@ -309,7 +312,8 @@ object NsqConfigSpec {
       )
     ),
     adaptersSchemas = adaptersSchemas,
-    decompression = Config.Decompression(5242880, 10000000),
+    decompression = DecompressionConfig(5242880, 10000000),
+    compression = Config.Compression(enabled = false, `type` = Config.Compression.ZSTD, gzipCompressionLevel = 6, zstdCompressionLevel = 9),
     http = Config.Http(Config.HttpClient(5.seconds)),
     iglu = Config.Iglu(2, 1.second)
   )

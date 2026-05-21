@@ -47,6 +47,7 @@ import com.snowplowanalytics.snowplow.enrich.common.utils.{AtomicError, OptionIo
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.registry.{
   AsnLookupsEnrichment,
   CrossNavigationEnrichment,
+  EventSpecEnrichment,
   HttpHeaderExtractorEnrichment,
   IabEnrichment,
   IpLookupsEnrichment,
@@ -1652,6 +1653,139 @@ class EnrichmentManagerSpec extends Specification with EitherMatchers with CatsE
           ok
         case other => ko(s"[$other] is not a SchemaViolations bad row and an enriched event without the unstructured event")
       }
+    }
+
+    "set event schema fields on the enriched event when the unstruct event data fails validation and emitFailed is true" >> {
+      val invalidUeData =
+        """{
+             "emailAddress": "hello@world.com",
+             "emailAddress2": "foo@bar.org",
+             "unallowedAdditionalField": "foo@bar.org"
+           }"""
+      val parameters = Map(
+        "e" -> "ue",
+        "tv" -> "js-0.13.1",
+        "p" -> "web",
+        "ue_pr" ->
+          s"""
+          {
+            "schema":"iglu:com.snowplowanalytics.snowplow/unstruct_event/jsonschema/1-0-0",
+            "data":{
+              "schema":"iglu:com.acme/email_sent/jsonschema/1-0-0",
+              "data": $invalidUeData
+            }
+          }"""
+      ).toOpt
+      val rawEvent = RawEvent(api, parameters, None, source, context)
+      EnrichmentManager
+        .enrichEvent[IO](
+          enrichmentReg,
+          client,
+          processor,
+          timestamp,
+          rawEvent,
+          AcceptInvalid.featureFlags,
+          IO.unit,
+          SpecHelpers.registryLookup,
+          atomicFieldLimits,
+          emitFailed = true,
+          SpecHelpers.DefaultMaxJsonDepth
+        )
+        .map {
+          case OptionIor.Both(_, enriched) =>
+            enriched.event_vendor must beEqualTo("com.acme")
+            enriched.event_name must beEqualTo("email_sent")
+            enriched.event_format must beEqualTo("jsonschema")
+            enriched.event_version must beEqualTo("1-0-0")
+          case other =>
+            ko(s"[$other] is not a Both with an enriched event")
+        }
+    }
+
+    "set event_version to the superseding schema version when unstruct event data fails validation against a superseded schema and emitFailed is true" >> {
+      val invalidSupersedingExampleData =
+        """{
+             "field_a": "value_a"
+           }"""
+      val parameters = Map(
+        "e" -> "ue",
+        "tv" -> "js-0.13.1",
+        "p" -> "web",
+        "ue_pr" ->
+          s"""
+          {
+            "schema":"iglu:com.snowplowanalytics.snowplow/unstruct_event/jsonschema/1-0-0",
+            "data":{
+              "schema":"iglu:com.acme/superseding_example/jsonschema/1-0-0",
+              "data": $invalidSupersedingExampleData
+            }
+          }"""
+      ).toOpt
+      val rawEvent = RawEvent(api, parameters, None, source, context)
+      EnrichmentManager
+        .enrichEvent[IO](
+          enrichmentReg,
+          client,
+          processor,
+          timestamp,
+          rawEvent,
+          AcceptInvalid.featureFlags,
+          IO.unit,
+          SpecHelpers.registryLookup,
+          atomicFieldLimits,
+          emitFailed = true,
+          SpecHelpers.DefaultMaxJsonDepth
+        )
+        .map {
+          case OptionIor.Both(_, enriched) =>
+            enriched.event_vendor must beEqualTo("com.acme")
+            enriched.event_name must beEqualTo("superseding_example")
+            enriched.event_format must beEqualTo("jsonschema")
+            enriched.event_version must beEqualTo("1-0-1")
+          case other =>
+            ko(s"[$other] is not a Both with an enriched event")
+        }
+    }
+
+    "leave event schema fields unset when the unstruct event schema cannot be resolved and emitFailed is true" >> {
+      val parameters = Map(
+        "e" -> "ue",
+        "tv" -> "js-0.13.1",
+        "p" -> "web",
+        "ue_pr" ->
+          s"""
+          {
+            "schema":"iglu:com.snowplowanalytics.snowplow/unstruct_event/jsonschema/1-0-0",
+            "data":{
+              "schema":"iglu:com.snowplowanalytics.snowplow/foo/jsonschema/1-0-0",
+              "data": {}
+            }
+          }"""
+      ).toOpt
+      val rawEvent = RawEvent(api, parameters, None, source, context)
+      EnrichmentManager
+        .enrichEvent[IO](
+          enrichmentReg,
+          client,
+          processor,
+          timestamp,
+          rawEvent,
+          AcceptInvalid.featureFlags,
+          IO.unit,
+          SpecHelpers.registryLookup,
+          atomicFieldLimits,
+          emitFailed = true,
+          SpecHelpers.DefaultMaxJsonDepth
+        )
+        .map {
+          case OptionIor.Both(_, enriched) =>
+            Option(enriched.event_vendor) must beNone
+            Option(enriched.event_name) must beNone
+            Option(enriched.event_format) must beNone
+            Option(enriched.event_version) must beNone
+          case other =>
+            ko(s"[$other] is not a Both with an enriched event")
+        }
     }
 
     "remove the invalid context and enrich the event if emitFailed is set to true" >> {
@@ -3747,6 +3881,224 @@ class EnrichmentManagerSpec extends Specification with EitherMatchers with CatsE
         }
       )
     }
+
+    "attach event spec validation context even when schema validation fails" >> {
+      val emailSentKey = SchemaKey("com.acme", "email_sent", "jsonschema", SchemaVer.Full(1, 0, 0))
+      val eventSpecSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "event_specification", "jsonschema", SchemaVer.Full(1, 0, 4))
+      val validationFailureSchemaKey =
+        SchemaKey("com.snowplowanalytics.snowplow", "event_specification_validation", "jsonschema", SchemaVer.Full(1, 0, 0))
+      val specId = "test-spec-id"
+
+      val spec = EventSpecEnrichment.EventSpec(
+        id = specId,
+        name = "Test spec",
+        version = Some(0),
+        schemaKey = emailSentKey,
+        constraint = None,
+        entities = List(
+          EventSpecEnrichment.Entity(
+            schemaKey = SchemaKey("com.acme", "required_entity", "jsonschema", SchemaVer.Full(1, 0, 0)),
+            minCardinality = Some(1),
+            maxCardinality = None,
+            constraint = None
+          )
+        )
+      )
+
+      val parameters = Map(
+        "e" -> "ue",
+        "tv" -> "js-0.13.1",
+        "p" -> "web",
+        "ue_pr" ->
+          s"""{
+            "schema":"iglu:com.snowplowanalytics.snowplow/unstruct_event/jsonschema/1-0-0",
+            "data":{
+              "schema":"iglu:com.acme/email_sent/jsonschema/1-0-0",
+              "data":{
+                "emailAddress":"hello@world.com",
+                "emailAddress2":"foo@bar.org",
+                "unallowedAdditionalField":"triggers-schema-validation-failure"
+              }
+            }
+          }""",
+        "co" ->
+          s"""{
+            "schema":"iglu:com.snowplowanalytics.snowplow/contexts/jsonschema/1-0-0",
+            "data":[{
+              "schema":"${eventSpecSchemaKey.toSchemaUri}",
+              "data":{"id":"$specId","version":0}
+            }]
+          }"""
+      ).toOpt
+
+      val rawEvent = RawEvent(api, parameters, None, source, context)
+
+      EventSpecEnrichment.createFromSpecs[IO](List(spec)).flatMap {
+        case Left(e) => IO.raiseError(new RuntimeException(e))
+        case Right(ese) =>
+          val reg: EnrichmentRegistry[IO] = enrichmentReg.copy(eventSpec = Some(ese))
+          EnrichmentManager
+            .enrichEvent[IO](
+              reg,
+              client,
+              processor,
+              timestamp,
+              rawEvent,
+              AcceptInvalid.featureFlags,
+              IO.unit,
+              SpecHelpers.registryLookup,
+              atomicFieldLimits,
+              emitFailed = true,
+              SpecHelpers.DefaultMaxJsonDepth
+            )
+            .map {
+              case OptionIor.Both(_: BadRow.SchemaViolations, enrichedEvent) =>
+                val hasSchemaFailure = enrichedEvent.derived_contexts.exists(_.schema === Failure.failureSchemaKey)
+                val hasEventSpecFailure = enrichedEvent.derived_contexts.exists(_.schema === validationFailureSchemaKey)
+                (hasSchemaFailure must beTrue) and (hasEventSpecFailure must beTrue)
+              case other => ko(s"Expected Both(SchemaViolations, EnrichedEvent) but got $other")
+            }
+      }
+    }
+
+    "attach event spec validation context for page_ping even when schema validation fails on context" >> {
+      val pagePingSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "page_ping", "jsonschema", SchemaVer.Full(1, 0, 0))
+      val eventSpecSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "event_specification", "jsonschema", SchemaVer.Full(1, 0, 4))
+      val validationFailureSchemaKey =
+        SchemaKey("com.snowplowanalytics.snowplow", "event_specification_validation", "jsonschema", SchemaVer.Full(1, 0, 0))
+      val specId = "test-page-ping-spec"
+
+      val spec = EventSpecEnrichment.EventSpec(
+        id = specId,
+        name = "Page ping spec",
+        version = Some(0),
+        schemaKey = pagePingSchemaKey,
+        constraint = None,
+        entities = List(
+          EventSpecEnrichment.Entity(
+            schemaKey = SchemaKey("com.acme", "required_entity", "jsonschema", SchemaVer.Full(1, 0, 0)),
+            minCardinality = Some(1),
+            maxCardinality = None,
+            constraint = None
+          )
+        )
+      )
+
+      val parameters = Map(
+        "e" -> "pp",
+        "tv" -> "js-0.13.1",
+        "p" -> "web",
+        "co" ->
+          s"""{
+            "schema":"iglu:com.snowplowanalytics.snowplow/contexts/jsonschema/1-0-0",
+            "data":[
+              {
+                "schema":"iglu:com.acme/email_sent/jsonschema/1-0-0",
+                "data":{
+                  "emailAddress":"hello@world.com",
+                  "emailAddress2":"foo@bar.org",
+                  "unallowedAdditionalField":"triggers-schema-validation-failure"
+                }
+              },
+              {
+                "schema":"${eventSpecSchemaKey.toSchemaUri}",
+                "data":{"id":"$specId","version":0}
+              }
+            ]
+          }"""
+      ).toOpt
+
+      val rawEvent = RawEvent(api, parameters, None, source, context)
+
+      EventSpecEnrichment.createFromSpecs[IO](List(spec)).flatMap {
+        case Left(e) => IO.raiseError(new RuntimeException(e))
+        case Right(ese) =>
+          val reg: EnrichmentRegistry[IO] = enrichmentReg.copy(eventSpec = Some(ese))
+          EnrichmentManager
+            .enrichEvent[IO](
+              reg,
+              client,
+              processor,
+              timestamp,
+              rawEvent,
+              AcceptInvalid.featureFlags,
+              IO.unit,
+              SpecHelpers.registryLookup,
+              atomicFieldLimits,
+              emitFailed = true,
+              SpecHelpers.DefaultMaxJsonDepth
+            )
+            .map {
+              case OptionIor.Both(_: BadRow.SchemaViolations, enrichedEvent) =>
+                val hasSchemaFailure = enrichedEvent.derived_contexts.exists(_.schema === Failure.failureSchemaKey)
+                val hasEventSpecFailure = enrichedEvent.derived_contexts.exists(_.schema === validationFailureSchemaKey)
+                (hasSchemaFailure must beTrue) and (hasEventSpecFailure must beTrue)
+              case other => ko(s"Expected Both(SchemaViolations, EnrichedEvent) but got $other")
+            }
+      }
+    }
+
+    "attach event spec inference context for page_ping even when schema validation fails on context" >> {
+      val pagePingSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "page_ping", "jsonschema", SchemaVer.Full(1, 0, 0))
+      val eventSpecSchemaKey = SchemaKey("com.snowplowanalytics.snowplow", "event_specification", "jsonschema", SchemaVer.Full(1, 0, 4))
+      val specId = "test-page-ping-inference-spec"
+
+      val spec = EventSpecEnrichment.EventSpec(
+        id = specId,
+        name = "Page ping inference spec",
+        version = Some(0),
+        schemaKey = pagePingSchemaKey,
+        constraint = None,
+        entities = List.empty
+      )
+
+      val parameters = Map(
+        "e" -> "pp",
+        "tv" -> "js-0.13.1",
+        "p" -> "web",
+        "co" ->
+          s"""{
+            "schema":"iglu:com.snowplowanalytics.snowplow/contexts/jsonschema/1-0-0",
+            "data":[{
+              "schema":"iglu:com.acme/email_sent/jsonschema/1-0-0",
+              "data":{
+                "emailAddress":"hello@world.com",
+                "emailAddress2":"foo@bar.org",
+                "unallowedAdditionalField":"triggers-schema-validation-failure"
+              }
+            }]
+          }"""
+      ).toOpt
+
+      val rawEvent = RawEvent(api, parameters, None, source, context)
+
+      EventSpecEnrichment.createFromSpecs[IO](List(spec)).flatMap {
+        case Left(e) => IO.raiseError(new RuntimeException(e))
+        case Right(ese) =>
+          val reg: EnrichmentRegistry[IO] = enrichmentReg.copy(eventSpec = Some(ese))
+          EnrichmentManager
+            .enrichEvent[IO](
+              reg,
+              client,
+              processor,
+              timestamp,
+              rawEvent,
+              AcceptInvalid.featureFlags,
+              IO.unit,
+              SpecHelpers.registryLookup,
+              atomicFieldLimits,
+              emitFailed = true,
+              SpecHelpers.DefaultMaxJsonDepth
+            )
+            .map {
+              case OptionIor.Both(_: BadRow.SchemaViolations, enrichedEvent) =>
+                val hasEventSpecContext = enrichedEvent.derived_contexts.exists(_.schema === eventSpecSchemaKey)
+                hasEventSpecContext must beTrue
+              case other => ko(s"Expected Both(SchemaViolations, EnrichedEvent) but got $other")
+            }
+      }
+    }
+
   }
 }
 

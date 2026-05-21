@@ -1,3 +1,19 @@
+6.11.0 (2026-04-28)
+------------------
+Improve yauaa upgrade skill for clearer presentation of results (#231)
+Set event schema fields for unstruct events that fail schema validation (#228)
+Bump dependencies for 6.11.0 release (#230)
+Upgrade yauaa to 8.1.1 (#229)
+Add Claude Code GitHub Action workflow (#227)
+Decompression: use decompressedStream from common-streams 0.24.0 (#225)
+Add good_bytes metric (#226)
+Attach validation result context in event spec enrichment (#222)
+Use decompression from common-streams (#219)
+Add compression feature (#224)
+Add yauaa-upgrade Claude skill (#223)
+Test YAUAA schema compatibility using library's bundled corpus (#221)
+[DPS-1879] Implement validation path and branching logic (#213)
+
 6.10.0 (2026-04-02)
 ------------------
 Use correct version of event spec context (#216)

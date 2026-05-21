@@ -27,7 +27,7 @@ import com.snowplowanalytics.snowplow.badrows.FailureDetails
 
 import com.snowplowanalytics.snowplow.enrich.common.enrichments.Failure
 import com.snowplowanalytics.snowplow.enrich.common.outputs.EnrichedEvent
-import com.snowplowanalytics.snowplow.enrich.common.utils.IgluUtils.{Contexts, Unstruct, ValidSDJ}
+import com.snowplowanalytics.snowplow.enrich.common.utils.IgluUtils.{Contexts, InvalidUnstruct, ValidSDJ, ValidUnstruct}
 
 import com.snowplowanalytics.snowplow.enrich.common.SpecHelpers
 
@@ -251,7 +251,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         }
     }
 
-    "return a FailureDetails.SchemaViolation.IgluError containing a ValidationError if the JSON in .data is not a valid SDJ" >> {
+    "return a FailureDetails.SchemaViolation.IgluError containing a ValidationError and an InvalidUnstruct if the JSON in .data is not a valid SDJ" >> {
       val json = invalidEmailSentData.toJson
 
       IgluUtils
@@ -267,8 +267,8 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
                 List(
                   Failure.SchemaViolation(FailureDetails.SchemaViolation.IgluError(_, _: ValidationError), `unstructFieldName`, `json`, _)
                 ),
-                None
-              ) =>
+                Some(InvalidUnstruct(schema))
+              ) if schema == emailSentSchema =>
             ok
           case other => ko(s"[$other] is not expected one")
         }
@@ -307,10 +307,10 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         )
         .run
         .map {
-          case (Nil, Some(Unstruct(ValidSDJ(sdj, None)))) if sdj.schema == emailSentSchema => ok
-          case (Nil, Some(s)) =>
+          case (Nil, Some(ValidUnstruct(ValidSDJ(sdj, None)))) if sdj.schema == emailSentSchema => ok
+          case (Nil, Some(_)) =>
             ko(
-              s"unstructured event's schema [${s.unstruct.sdj.schema}] does not match expected schema [${emailSentSchema}]"
+              s"unstructured event's schema does not match expected schema [${emailSentSchema}]"
             )
           case other => ko(s"no unstructured event was extracted [$other]")
         }
@@ -328,11 +328,11 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         )
         .run
         .map {
-          case (Nil, Some(Unstruct(ValidSDJ(sdj, Some(`expectedValidationInfo`))))) if sdj.schema == supersedingExampleSchema101 =>
+          case (Nil, Some(ValidUnstruct(ValidSDJ(sdj, Some(`expectedValidationInfo`))))) if sdj.schema == supersedingExampleSchema101 =>
             ok
-          case (Nil, Some(s)) =>
+          case (Nil, Some(_)) =>
             ko(
-              s"unstructured event's schema [${s.unstruct.sdj.schema}] does not match expected schema [${supersedingExampleSchema101}]"
+              s"unstructured event's schema does not match expected schema [${supersedingExampleSchema101}]"
             )
           case other => ko(s"no unstructured event was extracted [$other]")
         }
@@ -347,13 +347,41 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         )
         .run
         .map {
-          case (Nil, Some(Unstruct(ValidSDJ(sdj, Some(`expectedValidationInfo`))))) if sdj.schema == supersedingExampleSchema101 =>
+          case (Nil, Some(ValidUnstruct(ValidSDJ(sdj, Some(`expectedValidationInfo`))))) if sdj.schema == supersedingExampleSchema101 =>
             ok
-          case (Nil, Some(s)) =>
+          case (Nil, Some(_)) =>
             ko(
-              s"unstructured event's schema [${s.unstruct.sdj.schema}] does not match expected schema [${supersedingExampleSchema101}]"
+              s"unstructured event's schema does not match expected schema [${supersedingExampleSchema101}]"
             )
           case other => ko(s"no unstructured event was extracted [$other]")
+        }
+    }
+
+    "return an InvalidUnstruct with the superseding schema version when data fails validation against a superseded schema" >> {
+      val invalidSupersedingExampleData = s"""{"field_a": "value_a"}"""
+      val invalidSupersedingExample = s"""{
+        "schema": "${supersedingExampleSchema100.toSchemaUri}",
+        "data": $invalidSupersedingExampleData
+      }"""
+      val json = invalidSupersedingExampleData.toJson
+
+      IgluUtils
+        .parseAndValidateUnstruct(Some(buildUnstruct(invalidSupersedingExample)),
+                                  SpecHelpers.client,
+                                  SpecHelpers.registryLookup,
+                                  SpecHelpers.DefaultMaxJsonDepth,
+                                  SpecHelpers.etlTstamp
+        )
+        .run
+        .map {
+          case (
+                List(
+                  Failure.SchemaViolation(FailureDetails.SchemaViolation.IgluError(_, _: ValidationError), `unstructFieldName`, `json`, _)
+                ),
+                Some(InvalidUnstruct(schema))
+              ) if schema == supersedingExampleSchema101 =>
+            ok
+          case other => ko(s"[$other] is not a ValidationError with InvalidUnstruct for the superseding schema")
         }
     }
 
@@ -781,7 +809,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         )
         .run
         .map {
-          case (List(_: Failure.SchemaViolation), (None, None)) =>
+          case (List(_: Failure.SchemaViolation), (Some(_: InvalidUnstruct), None)) =>
             ok
           case other => ko(s"[$other] isn't an error with SchemaViolation")
         }
@@ -842,7 +870,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         )
         .run
         .map {
-          case (Nil, (Some(Unstruct(unstruct)), Some(Contexts(contexts))))
+          case (Nil, (Some(ValidUnstruct(unstruct)), Some(Contexts(contexts))))
               if contexts.size == 2
                 && (List(unstruct.sdj) ++ contexts.toList.map(_.sdj)).forall(_.schema == emailSentSchema) =>
             ok
@@ -875,7 +903,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
                                         `invalidEmailSentJson`,
                                         _
                 ) :: _,
-                (Some(Unstruct(unstruct)), None)
+                (Some(ValidUnstruct(unstruct)), None)
               ) if unstruct.sdj.schema == emailSentSchema =>
             ok
           case other =>
@@ -907,7 +935,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
                                         `invalidEmailSentJson`,
                                         _
                 ) :: _,
-                (None, Some(Contexts(contexts)))
+                (Some(InvalidUnstruct(emailSentSchema)), Some(Contexts(contexts)))
               ) if contexts.size == 1 && contexts.head.sdj.schema == emailSentSchema =>
             ok
           case other =>
@@ -997,7 +1025,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers with CatsEffect
         )
         .run
         .map {
-          case (Nil, (Some(Unstruct(unstruct)), Some(Contexts(contexts))))
+          case (Nil, (Some(ValidUnstruct(unstruct)), Some(Contexts(contexts))))
               if contexts.size == 2
                 && contexts.toList.count(_.sdj.schema == supersedingExampleSchema101) == 2
                 && contexts.toList.map(_.validationInfo.get).forall(_ == expectedValidationInfo)
